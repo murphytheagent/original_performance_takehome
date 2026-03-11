@@ -345,28 +345,12 @@ class KernelBuilder:
 
             carry_deps = [hash_done, next_path_id]
             if depth == 0 and self.forest_height >= 1:
-                mask_id = add_bit_mask(
-                    addr,
-                    path,
-                    self.one_vec,
-                    None,
+                table_id = add_op(
+                    "flow",
+                    ("vselect", node, path, self.depth1_alt_vec, self.depth1_base_vec),
                     [next_path_id],
                     local_group,
                     14,
-                )
-                diff_id = add_op(
-                    "valu",
-                    ("&", node, self.depth1_diff_vec, addr),
-                    [mask_id],
-                    local_group,
-                    16,
-                )
-                table_id = add_op(
-                    "valu",
-                    ("^", node, self.depth1_base_vec, node),
-                    [diff_id],
-                    local_group,
-                    17,
                 )
                 if cache_next_nodes:
                     carry_deps.append(table_id)
@@ -376,77 +360,56 @@ class KernelBuilder:
                         ("vstore", self.depth1_table_addrs[block], node),
                         [table_id],
                         local_group,
-                        18,
+                        15,
                     )
             elif depth == 1 and self.forest_height >= 2:
-                hi_mask_id = add_bit_mask(
-                    addr,
-                    path,
-                    self.two_vec,
-                    self.one_vec,
+                lo_mask_id = add_op(
+                    "valu",
+                    ("&", tmp1, path, self.one_vec),
                     [next_path_id],
                     local_group,
                     14,
                 )
-                lo_mask_id = add_bit_mask(
-                    node,
-                    path,
-                    self.one_vec,
-                    None,
+                hi_mask_id = add_op(
+                    "valu",
+                    ("&", tmp2, path, self.two_vec),
                     [next_path_id],
                     local_group,
                     14,
-                )
-                left_diff_id = add_op(
-                    "valu",
-                    ("&", tmp1, self.depth2_left_diff_vec, addr),
-                    [hi_mask_id],
-                    local_group,
-                    17,
-                )
-                right_diff_id = add_op(
-                    "valu",
-                    ("&", tmp2, self.depth2_right_diff_vec, addr),
-                    [hi_mask_id],
-                    local_group,
-                    17,
                     1,
                 )
                 left_id = add_op(
-                    "valu",
-                    ("^", tmp1, self.depth2_left_base_vec, tmp1),
-                    [left_diff_id],
+                    "flow",
+                    (
+                        "vselect",
+                        addr,
+                        tmp1,
+                        self.depth2_left_alt_vec,
+                        self.depth2_left_base_vec,
+                    ),
+                    [lo_mask_id],
                     local_group,
-                    18,
+                    15,
                 )
                 right_id = add_op(
-                    "valu",
-                    ("^", tmp2, self.depth2_right_base_vec, tmp2),
-                    [right_diff_id],
+                    "flow",
+                    (
+                        "vselect",
+                        node,
+                        tmp1,
+                        self.depth2_right_alt_vec,
+                        self.depth2_right_base_vec,
+                    ),
+                    [lo_mask_id],
                     local_group,
-                    18,
-                    1,
-                )
-                mix_id = add_op(
-                    "valu",
-                    ("^", addr, tmp1, tmp2),
-                    [left_id, right_id],
-                    local_group,
-                    19,
-                )
-                select_id = add_op(
-                    "valu",
-                    ("&", addr, addr, node),
-                    [mix_id, lo_mask_id],
-                    local_group,
-                    20,
+                    16,
                 )
                 table_id = add_op(
-                    "valu",
-                    ("^", node, tmp1, addr),
-                    [select_id],
+                    "flow",
+                    ("vselect", node, tmp2, node, addr),
+                    [left_id, right_id, hi_mask_id],
                     local_group,
-                    21,
+                    17,
                 )
                 if cache_next_nodes:
                     carry_deps.append(table_id)
@@ -456,7 +419,7 @@ class KernelBuilder:
                         ("vstore", self.depth2_table_addrs[block], node),
                         [table_id],
                         local_group,
-                        22,
+                        18,
                     )
 
             next_state_deps.append(carry_deps)
@@ -509,7 +472,7 @@ class KernelBuilder:
         inp_indices_p = forest_values_p + n_nodes
         inp_values_p = inp_indices_p + batch_size
         n_blocks = batch_size // VLEN
-        wave_size = min(16, n_blocks)
+        wave_size = min(18, n_blocks)
 
         self.zero_vec = self.scratch_vconst(0, "zero_vec")
         self.one_vec = self.scratch_vconst(1, "one_vec")
@@ -565,18 +528,11 @@ class KernelBuilder:
 
         self.root_vec = shallow_nodes[0]
         self.depth1_base_vec = shallow_nodes[1]
+        self.depth1_alt_vec = shallow_nodes[2]
         self.depth2_left_base_vec = shallow_nodes[3]
-        self.depth2_right_base_vec = shallow_nodes[4]
-        self.depth1_diff_vec = self.alloc_scratch("depth1_diff_vec", VLEN)
-        self.depth2_left_diff_vec = self.alloc_scratch("depth2_left_diff_vec", VLEN)
-        self.depth2_right_diff_vec = self.alloc_scratch("depth2_right_diff_vec", VLEN)
-        self.emit(
-            valu=[
-                ("^", self.depth1_diff_vec, shallow_nodes[1], shallow_nodes[2]),
-                ("^", self.depth2_left_diff_vec, shallow_nodes[3], shallow_nodes[5]),
-                ("^", self.depth2_right_diff_vec, shallow_nodes[4], shallow_nodes[6]),
-            ]
-        )
+        self.depth2_left_alt_vec = shallow_nodes[4]
+        self.depth2_right_base_vec = shallow_nodes[5]
+        self.depth2_right_alt_vec = shallow_nodes[6]
 
         value_addr0 = self.alloc_scratch("value_addr0")
         value_addr1 = self.alloc_scratch("value_addr1")
