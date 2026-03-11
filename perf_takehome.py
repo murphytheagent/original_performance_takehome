@@ -116,11 +116,14 @@ class KernelBuilder:
                     )
                 )
                 picked = ready[:limit]
-                if picked:
-                    instr[engine] = [op["slot"] for op in picked]
-                    for op in picked:
-                        remaining.remove(op["id"])
-                        completed_this_cycle.append(op["id"])
+                if not picked:
+                    continue
+
+                instr[engine] = [op["slot"] for op in picked]
+                for op in picked:
+                    remaining.remove(op["id"])
+                    completed_this_cycle.append(op["id"])
+
             assert instr, "Scheduler stalled on a cyclic dependency graph"
             done.update(completed_this_cycle)
             self.instrs.append(instr)
@@ -146,6 +149,55 @@ class KernelBuilder:
             )
             return op_id
 
+        def add_bit_mask(dest, src, bit_const, shift_const, deps, group, stage):
+            bit_id = add_op(
+                "valu",
+                ("&", dest, src, bit_const),
+                deps,
+                group,
+                stage,
+            )
+            if shift_const is not None:
+                bit_id = add_op(
+                    "valu",
+                    (">>", dest, dest, shift_const),
+                    [bit_id],
+                    group,
+                    stage + 1,
+                )
+                stage += 1
+            return add_op(
+                "valu",
+                ("-", dest, self.zero_vec, dest),
+                [bit_id],
+                group,
+                stage + 1,
+            )
+
+        def add_blend(dest, mask, pick_one, pick_zero, deps, group, stage, temp=None):
+            temp = dest if temp is None else temp
+            mix_id = add_op(
+                "valu",
+                ("^", temp, pick_one, pick_zero),
+                deps,
+                group,
+                stage,
+            )
+            mask_id = add_op(
+                "valu",
+                ("&", temp, temp, mask),
+                [mix_id],
+                group,
+                stage + 1,
+            )
+            return add_op(
+                "valu",
+                ("^", dest, pick_zero, temp),
+                [mask_id],
+                group,
+                stage + 2,
+            )
+
         for local_group, block in enumerate(groups):
             val = self.value_blocks[block]
             path = self.path_blocks[block]
@@ -153,9 +205,177 @@ class KernelBuilder:
             node = self.wave_node[local_group]
             tmp1 = self.wave_tmp1[local_group]
             tmp2 = self.wave_tmp2[local_group]
+            tmp3 = self.wave_tmp3[local_group]
+            mask = self.wave_mask[local_group]
             node_deps = []
             if depth == 0:
-                node_src = self.root_vec
+                node_src = self.shallow_nodes[0]
+            elif depth == 1:
+                mask_id = add_bit_mask(
+                    mask,
+                    path,
+                    self.one_vec,
+                    None,
+                    [],
+                    local_group,
+                    0,
+                )
+                node_deps.append(
+                    add_blend(
+                        node,
+                        mask,
+                        self.shallow_nodes[2],
+                        self.shallow_nodes[1],
+                        [mask_id],
+                        local_group,
+                        1,
+                    )
+                )
+                node_src = node
+            elif depth == 2:
+                bit1_id = add_bit_mask(
+                    mask,
+                    path,
+                    self.two_vec,
+                    self.one_vec,
+                    [],
+                    local_group,
+                    0,
+                )
+                left_id = add_blend(
+                    tmp1,
+                    mask,
+                    self.shallow_nodes[5],
+                    self.shallow_nodes[3],
+                    [bit1_id],
+                    local_group,
+                    1,
+                )
+                right_id = add_blend(
+                    tmp2,
+                    mask,
+                    self.shallow_nodes[6],
+                    self.shallow_nodes[4],
+                    [bit1_id],
+                    local_group,
+                    4,
+                )
+                bit0_id = add_bit_mask(
+                    addr,
+                    path,
+                    self.one_vec,
+                    None,
+                    [],
+                    local_group,
+                    1,
+                )
+                node_deps.append(
+                    add_blend(
+                        node,
+                        addr,
+                        tmp2,
+                        tmp1,
+                        [left_id, right_id, bit0_id],
+                        local_group,
+                        7,
+                    )
+                )
+                node_src = node
+            elif depth == 3:
+                bit2_id = add_bit_mask(
+                    mask,
+                    path,
+                    self.four_vec,
+                    self.two_vec,
+                    [],
+                    local_group,
+                    0,
+                )
+                high_00 = add_blend(
+                    tmp1,
+                    mask,
+                    self.shallow_nodes[11],
+                    self.shallow_nodes[7],
+                    [bit2_id],
+                    local_group,
+                    1,
+                )
+                high_01 = add_blend(
+                    tmp2,
+                    mask,
+                    self.shallow_nodes[12],
+                    self.shallow_nodes[8],
+                    [bit2_id],
+                    local_group,
+                    4,
+                )
+                high_10 = add_blend(
+                    node,
+                    mask,
+                    self.shallow_nodes[13],
+                    self.shallow_nodes[9],
+                    [bit2_id],
+                    local_group,
+                    7,
+                )
+                high_11 = add_blend(
+                    addr,
+                    mask,
+                    self.shallow_nodes[14],
+                    self.shallow_nodes[10],
+                    [bit2_id],
+                    local_group,
+                    10,
+                )
+                bit1_mid = add_bit_mask(
+                    mask,
+                    path,
+                    self.two_vec,
+                    self.one_vec,
+                    [high_00, high_01, high_10, high_11],
+                    local_group,
+                    13,
+                )
+                mid_0 = add_blend(
+                    tmp1,
+                    mask,
+                    node,
+                    tmp1,
+                    [bit1_mid],
+                    local_group,
+                    16,
+                    temp=tmp3,
+                )
+                mid_1 = add_blend(
+                    node,
+                    mask,
+                    addr,
+                    tmp2,
+                    [bit1_mid],
+                    local_group,
+                    19,
+                )
+                bit0_low = add_bit_mask(
+                    mask,
+                    path,
+                    self.one_vec,
+                    None,
+                    [mid_0, mid_1],
+                    local_group,
+                    22,
+                )
+                node_deps.append(
+                    add_blend(
+                        addr,
+                        mask,
+                        node,
+                        tmp1,
+                        [bit0_low],
+                        local_group,
+                        25,
+                    )
+                )
+                node_src = addr
             else:
                 addr_id = add_op(
                     "valu",
@@ -309,11 +529,12 @@ class KernelBuilder:
         inp_indices_p = forest_values_p + n_nodes
         inp_values_p = inp_indices_p + batch_size
         n_blocks = batch_size // VLEN
-        wave_size = min(16, n_blocks)
+        wave_size = min(13, n_blocks)
 
         self.zero_vec = self.scratch_vconst(0, "zero_vec")
         self.one_vec = self.scratch_vconst(1, "one_vec")
         self.two_vec = self.scratch_vconst(2, "two_vec")
+        self.four_vec = self.scratch_vconst(4, "four_vec")
         self.mul_4097_vec = self.scratch_vconst(4097, "mul_4097_vec")
         self.mul_33_vec = self.scratch_vconst(33, "mul_33_vec")
         self.mul_9_vec = self.scratch_vconst(9, "mul_9_vec")
@@ -351,11 +572,22 @@ class KernelBuilder:
         self.wave_tmp2 = [
             self.alloc_scratch(f"wave_tmp2_{i}", VLEN) for i in range(wave_size)
         ]
-        root_addr = self.scratch_const(forest_values_p, "root_addr")
-        root_scalar = self.alloc_scratch("root_scalar")
-        self.root_vec = self.alloc_scratch("root_vec", VLEN)
-        self.emit(load=[("load", root_scalar, root_addr)])
-        self.emit(valu=[("vbroadcast", self.root_vec, root_scalar)])
+        self.wave_tmp3 = [
+            self.alloc_scratch(f"wave_tmp3_{i}", VLEN) for i in range(wave_size)
+        ]
+        self.wave_mask = [
+            self.alloc_scratch(f"wave_mask_{i}", VLEN) for i in range(wave_size)
+        ]
+        preload_scalar = self.alloc_scratch("preload_scalar")
+        self.shallow_nodes = {}
+        for node_idx in range(15):
+            node_addr = self.scratch_const(
+                forest_values_p + node_idx, f"shallow_node_addr_{node_idx}"
+            )
+            node_vec = self.alloc_scratch(f"shallow_node_{node_idx}", VLEN)
+            self.emit(load=[("load", preload_scalar, node_addr)])
+            self.emit(valu=[("vbroadcast", node_vec, preload_scalar)])
+            self.shallow_nodes[node_idx] = node_vec
 
         value_addr_consts = [
             self.scratch_const(inp_values_p + block * VLEN, f"value_addr_{block}")
@@ -370,7 +602,6 @@ class KernelBuilder:
                 )
             self.emit(load=load_slots)
 
-        self.emit(flow=[("pause",)])
         for round_idx in range(rounds):
             depth = round_idx % (forest_height + 1)
             is_final = round_idx == rounds - 1
@@ -391,7 +622,6 @@ class KernelBuilder:
                     )
                 )
             self.emit(store=store_slots)
-        self.emit(flow=[("pause",)])
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []

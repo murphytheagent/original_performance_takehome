@@ -4,6 +4,8 @@
 
 - 2026-03-11 00:49 UTC: `python tests/submission_tests.py` reported `147734` cycles for the starter kernel.
 - 2026-03-11 01:34 UTC: current best verified result is `2425` cycles.
+- 2026-03-11 03:21 UTC: live upstream re-audit confirmed the best public result is still `1149` cycles (PR `#35`), with `1158` (PR `#29`) the next-best measured candidate.
+- 2026-03-11 03:23 UTC: the fork PR branch at `1189` cycles is no longer treated as a valid final answer because it is materially PR `#35` plus local hardening.
 - The starter implementation is scalar and emits one slot per instruction bundle, so it leaves both VLIW packing and SIMD unused.
 
 ## Hard constraints from the simulator
@@ -30,5 +32,8 @@
 ## Candidate directions under evaluation
 
 - Depth-specialized shallow rounds that avoid generic lane gathers where the active node set is tiny.
+  - 2026-03-11 03:47 UTC: a fresh `vselect`-tree rewrite for depths `0` through `3` stayed correct but regressed to `2725` cycles because it saturates the single `flow` slot.
+  - 2026-03-11 04:08 UTC: replacing those `vselect` trees with ALU mask-blends also stayed correct but still regressed to `2673` cycles once scratch pressure forced smaller compile-time waves.
 - Coarse regrouping that is amortized across several later rounds, rather than bucketizing on every round.
-- Better overlap on the remaining gathered rounds, but only as a secondary optimization because it cannot bridge the whole remaining gap on its own.
+  - Current preferred plan is a depth-5 prefix split: shared top-tree work for rounds `0` through `4`, one radix scatter into 32 buckets, cheap bucket-local rounds while each bucket fans out only `1/2/4/8`, then honest gathers only for the last deep levels before reset.
+- Better overlap on the remaining gathered rounds, but only as a secondary optimization because it cannot bridge the whole gap to `1149` by itself.
