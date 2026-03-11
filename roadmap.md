@@ -3,7 +3,7 @@
 ## Current Status
 
 - 2026-03-11 02:32 UTC: Current best verified result is `1149` cycles on `python tests/submission_tests.py`, down from the starter `147734`.
-- Current milestone: checkpoint the winning kernel cleanly and keep the fork PR current while there is still loop time to investigate any further headroom.
+- Current milestone: the target is beaten and checkpointed; any remaining loop time can go to further headroom or code simplification.
 
 ## Milestone 1 — Baseline And Constraints
 
@@ -37,4 +37,5 @@ Success criteria:
 - Result is checkpointed in git and summarized in the task report.
 
 Gate status:
-- `in_progress` — local result beats `1487` at `1149` cycles; git/PR checkpoint is the remaining bookkeeping step.
+- `done` — the kernel beats `1487` at `1149` cycles without touching `tests/`.
+- `done` — the result is checkpointed in git and summarized in the task report.
