@@ -276,7 +276,7 @@ class KernelBuilder:
         for local_group, block in enumerate(groups):
             round_start = list(state_deps[local_group])
             val = self.value_blocks[block]
-            path = self.path_blocks[block]
+            path = self.wave_path[local_group]
             addr = self.wave_addr[local_group]
             node = self.wave_node[local_group]
             tmp1 = self.wave_tmp1[local_group]
@@ -601,6 +601,125 @@ class KernelBuilder:
             )
         self._schedule_ops(ops)
 
+    def _append_stream_io_ops(
+        self,
+        ops,
+        next_id,
+        *,
+        pairs,
+        addr_regs,
+        kind,
+        group_base,
+        stage_base,
+    ):
+        def add_op(engine, slot, deps, group, stage, priority=0):
+            nonlocal next_id
+            op_id = next_id
+            next_id += 1
+            ops.append(
+                {
+                    "id": op_id,
+                    "engine": engine,
+                    "slot": slot,
+                    "deps": list(deps),
+                    "group": group,
+                    "stage": stage,
+                    "priority": priority,
+                }
+            )
+            return op_id
+
+        addr0, addr1 = addr_regs
+        addr_deps = []
+        for pair_i, (block0, block1) in enumerate(pairs):
+            stage = stage_base + pair_i
+            group = group_base + pair_i
+            io_deps = list(addr_deps)
+            if kind == "load":
+                add_op("load", ("vload", self.value_blocks[block0], addr0), io_deps, group, stage)
+                add_op(
+                    "load",
+                    ("vload", self.value_blocks[block1], addr1),
+                    io_deps,
+                    group,
+                    stage,
+                    1,
+                )
+            else:
+                add_op("store", ("vstore", addr0, self.value_blocks[block0]), io_deps, group, stage)
+                add_op(
+                    "store",
+                    ("vstore", addr1, self.value_blocks[block1]),
+                    io_deps,
+                    group,
+                    stage,
+                    1,
+                )
+
+            if pair_i + 1 < len(pairs):
+                inc0 = add_op("alu", ("+", addr0, addr0, self.pair_stride), io_deps, group, stage, 2)
+                inc1 = add_op(
+                    "alu",
+                    ("+", addr1, addr1, self.pair_stride),
+                    io_deps,
+                    group,
+                    stage,
+                    3,
+                )
+                addr_deps = [inc0, inc1]
+
+        return next_id
+
+    def _build_vector_round_sequence_with_io(
+        self,
+        groups,
+        round_specs,
+        *,
+        prefetch_pairs=None,
+        prefetch_addr_regs=None,
+        store_pairs=None,
+        store_addr_regs=None,
+    ):
+        ops = []
+        next_id = 0
+        state_deps = [[] for _ in groups]
+        for round_spec in round_specs:
+            next_id, state_deps = self._append_vector_round_ops(
+                ops,
+                next_id,
+                groups,
+                round_spec["depth"],
+                round_spec["is_final"],
+                use_cached_nodes=round_spec.get("use_cached_nodes", False),
+                cache_next_nodes=round_spec.get("cache_next_nodes", False),
+                state_deps=state_deps,
+            )
+
+        io_group_base = len(groups) + 1000
+        if prefetch_pairs:
+            next_id = self._append_stream_io_ops(
+                ops,
+                next_id,
+                pairs=prefetch_pairs,
+                addr_regs=prefetch_addr_regs,
+                kind="load",
+                group_base=io_group_base,
+                stage_base=1000,
+            )
+            io_group_base += len(prefetch_pairs) + 1
+        if store_pairs:
+            next_id = self._append_stream_io_ops(
+                ops,
+                next_id,
+                pairs=store_pairs,
+                addr_regs=store_addr_regs,
+                kind="store",
+                group_base=io_group_base,
+                stage_base=1100,
+            )
+
+        self._schedule_ops(ops)
+
     def _build_vector_wave(
         self,
         groups,
@@ -665,8 +784,8 @@ class KernelBuilder:
         self.value_blocks = [
             self.alloc_scratch(f"value_block_{block}", VLEN) for block in range(n_blocks)
         ]
-        self.path_blocks = [
-            self.alloc_scratch(f"path_block_{block}", VLEN) for block in range(n_blocks)
+        self.wave_path = [
+            self.alloc_scratch(f"wave_path_{i}", VLEN) for i in range(wave_size)
         ]
         self.wave_addr = [
             self.alloc_scratch(f"wave_addr_{i}", VLEN) for i in range(wave_size)
@@ -724,12 +843,13 @@ class KernelBuilder:
         self.depth2_right_alt_vec = shallow_nodes[6]
         self.depth3_nodes = [shallow_nodes[node_idx] for node_idx in range(7, 15)]
 
-        for block in range(0, n_blocks, 2):
+        first_wave_blocks = n_blocks if rounds == 0 else min(wave_size, n_blocks)
+        for block in range(0, first_wave_blocks, 2):
             load_slots = [("vload", self.value_blocks[block], value_addr0)]
             if block + 1 < n_blocks:
                 load_slots.append(("vload", self.value_blocks[block + 1], value_addr1))
             alu_slots = []
-            if block + 2 < n_blocks:
+            if block + 2 < first_wave_blocks:
                 alu_slots.append(("+", value_addr0, value_addr0, self.pair_stride))
                 alu_slots.append(("+", value_addr1, value_addr1, self.pair_stride))
             self.emit(load=load_slots, alu=alu_slots)
@@ -752,16 +872,55 @@ class KernelBuilder:
 
             for block in range(0, n_blocks, wave_size):
                 groups = list(range(block, min(block + wave_size, n_blocks)))
-                self._build_vector_round_sequence(groups, round_specs)
+                prefetch_pairs = None
+                if block + wave_size < n_blocks:
+                    next_groups = list(
+                        range(block + wave_size, min(block + 2 * wave_size, n_blocks))
+                    )
+                    if len(next_groups) >= 2:
+                        prefetch_pairs = [
+                            (next_groups[pair_i], next_groups[pair_i + 1])
+                            for pair_i in range(0, len(next_groups), 2)
+                        ]
+                        self.emit(
+                            load=[
+                                ("const", value_addr0, inp_values_p + next_groups[0] * VLEN),
+                                ("const", value_addr1, inp_values_p + (next_groups[0] + 1) * VLEN),
+                            ]
+                        )
+
+                store_pairs = None
+                if block >= wave_size:
+                    prev_groups = list(range(block - wave_size, block))
+                    store_pairs = [
+                        (prev_groups[pair_i], prev_groups[pair_i + 1])
+                        for pair_i in range(0, len(prev_groups), 2)
+                    ]
+                    self.emit(
+                        load=[
+                            ("const", init_scalar0, inp_values_p + prev_groups[0] * VLEN),
+                            ("const", init_scalar1, inp_values_p + (prev_groups[0] + 1) * VLEN),
+                        ]
+                    )
+
+                self._build_vector_round_sequence_with_io(
+                    groups,
+                    round_specs,
+                    prefetch_pairs=prefetch_pairs,
+                    prefetch_addr_regs=(value_addr0, value_addr1),
+                    store_pairs=store_pairs,
+                    store_addr_regs=(init_scalar0, init_scalar1),
+                )
             round_idx += fused_rounds
 
+        final_store_start = 0 if rounds == 0 else max(0, n_blocks - wave_size)
         self.emit(
             load=[
-                ("const", value_addr0, inp_values_p),
-                ("const", value_addr1, inp_values_p + VLEN),
+                ("const", value_addr0, inp_values_p + final_store_start * VLEN),
+                ("const", value_addr1, inp_values_p + (final_store_start + 1) * VLEN),
             ]
         )
-        for block in range(0, n_blocks, 2):
+        for block in range(final_store_start, n_blocks, 2):
             store_slots = [("vstore", value_addr0, self.value_blocks[block])]
             if block + 1 < n_blocks:
                 store_slots.append(
