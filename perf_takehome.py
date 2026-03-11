@@ -106,14 +106,23 @@ class KernelBuilder:
                     if by_id[op_id]["engine"] == engine
                     and all(dep in cycle_done for dep in by_id[op_id]["deps"])
                 ]
-                ready.sort(
-                    key=lambda op: (
+                def sort_key(op):
+                    if engine == "valu":
+                        return (
+                            0 if op["stage"] < 7 else 1,
+                            -op["group"],
+                            op["stage"],
+                            op["priority"],
+                            op["id"],
+                        )
+                    return (
                         op["group"],
                         op["stage"],
                         op["priority"],
                         op["id"],
                     )
-                )
+
+                ready.sort(key=sort_key)
                 picked = ready[:limit]
                 if not picked:
                     continue
