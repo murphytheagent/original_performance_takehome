@@ -611,6 +611,7 @@ class KernelBuilder:
         kind,
         group_base,
         stage_base,
+        pair_deps=None,
     ):
         def add_op(engine, slot, deps, group, stage, priority=0):
             nonlocal next_id
@@ -635,6 +636,8 @@ class KernelBuilder:
             stage = stage_base + pair_i
             group = group_base + pair_i
             io_deps = list(addr_deps)
+            if pair_deps is not None:
+                io_deps.extend(pair_deps[pair_i])
             if kind == "load":
                 add_op("load", ("vload", self.value_blocks[block0], addr0), io_deps, group, stage)
                 add_op(
@@ -679,6 +682,8 @@ class KernelBuilder:
         prefetch_addr_regs=None,
         store_pairs=None,
         store_addr_regs=None,
+        final_store_pairs=None,
+        final_store_addr_regs=None,
     ):
         ops = []
         next_id = 0
@@ -717,6 +722,23 @@ class KernelBuilder:
                 group_base=io_group_base,
                 stage_base=1100,
             )
+            io_group_base += len(store_pairs) + 1
+        if final_store_pairs:
+            local_index = {group: idx for idx, group in enumerate(groups)}
+            final_store_pair_deps = [
+                state_deps[local_index[block0]] + state_deps[local_index[block1]]
+                for block0, block1 in final_store_pairs
+            ]
+            next_id = self._append_stream_io_ops(
+                ops,
+                next_id,
+                pairs=final_store_pairs,
+                addr_regs=final_store_addr_regs,
+                kind="store",
+                group_base=io_group_base,
+                stage_base=1200,
+                pair_deps=final_store_pair_deps,
+            )
 
         self._schedule_ops(ops)
 
@@ -750,6 +772,7 @@ class KernelBuilder:
         inp_values_p = inp_indices_p + batch_size
         n_blocks = batch_size // VLEN
         wave_size = min(16, n_blocks)
+        use_overlapped_final_store = rounds != 0 and n_blocks == 2 * wave_size
 
         packed_vconsts = []
 
@@ -808,6 +831,8 @@ class KernelBuilder:
         value_addr1 = self.alloc_scratch("value_addr1")
         init_scalar0 = self.alloc_scratch("init_scalar0")
         init_scalar1 = self.alloc_scratch("init_scalar1")
+        final_store_addr0 = self.alloc_scratch("final_store_addr0")
+        final_store_addr1 = self.alloc_scratch("final_store_addr1")
 
         shallow_nodes = {
             node_idx: self.alloc_scratch(f"shallow_node_{node_idx}", VLEN)
@@ -903,6 +928,22 @@ class KernelBuilder:
                         ]
                     )
 
+                final_store_pairs = None
+                final_store_addr_regs = None
+                if block + wave_size >= n_blocks and use_overlapped_final_store:
+                    final_groups = list(range(block, min(block + wave_size, n_blocks)))
+                    final_store_pairs = [
+                        (final_groups[pair_i], final_groups[pair_i + 1])
+                        for pair_i in range(0, len(final_groups), 2)
+                    ]
+                    self.emit(
+                        load=[
+                            ("const", final_store_addr0, inp_values_p + final_groups[0] * VLEN),
+                            ("const", final_store_addr1, inp_values_p + (final_groups[0] + 1) * VLEN),
+                        ]
+                    )
+                    final_store_addr_regs = (final_store_addr0, final_store_addr1)
+
                 self._build_vector_round_sequence_with_io(
                     groups,
                     round_specs,
@@ -910,31 +951,34 @@ class KernelBuilder:
                     prefetch_addr_regs=(value_addr0, value_addr1),
                     store_pairs=store_pairs,
                     store_addr_regs=(init_scalar0, init_scalar1),
+                    final_store_pairs=final_store_pairs,
+                    final_store_addr_regs=final_store_addr_regs,
                 )
             round_idx += fused_rounds
 
-        final_store_start = 0 if rounds == 0 else max(0, n_blocks - wave_size)
-        self.emit(
-            load=[
-                ("const", value_addr0, inp_values_p + final_store_start * VLEN),
-                ("const", value_addr1, inp_values_p + (final_store_start + 1) * VLEN),
-            ]
-        )
-        for block in range(final_store_start, n_blocks, 2):
-            store_slots = [("vstore", value_addr0, self.value_blocks[block])]
-            if block + 1 < n_blocks:
-                store_slots.append(
-                    (
-                        "vstore",
-                        value_addr1,
-                        self.value_blocks[block + 1],
+        if not use_overlapped_final_store:
+            final_store_start = 0 if rounds == 0 else max(0, n_blocks - wave_size)
+            self.emit(
+                load=[
+                    ("const", value_addr0, inp_values_p + final_store_start * VLEN),
+                    ("const", value_addr1, inp_values_p + (final_store_start + 1) * VLEN),
+                ]
+            )
+            for block in range(final_store_start, n_blocks, 2):
+                store_slots = [("vstore", value_addr0, self.value_blocks[block])]
+                if block + 1 < n_blocks:
+                    store_slots.append(
+                        (
+                            "vstore",
+                            value_addr1,
+                            self.value_blocks[block + 1],
+                        )
                     )
-                )
-            alu_slots = []
-            if block + 2 < n_blocks:
-                alu_slots.append(("+", value_addr0, value_addr0, self.pair_stride))
-                alu_slots.append(("+", value_addr1, value_addr1, self.pair_stride))
-            self.emit(store=store_slots, alu=alu_slots)
+                alu_slots = []
+                if block + 2 < n_blocks:
+                    alu_slots.append(("+", value_addr0, value_addr0, self.pair_stride))
+                    alu_slots.append(("+", value_addr1, value_addr1, self.pair_stride))
+                self.emit(store=store_slots, alu=alu_slots)
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
