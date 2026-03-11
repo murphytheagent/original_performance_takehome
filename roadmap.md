@@ -5,6 +5,7 @@
 - 2026-03-11 03:07 UTC: Fork PR branch `perf-kernel-optimization` is still parked at a guarded `1189` cycles on `python tests/submission_tests.py`, down from the starter `147734`.
 - 2026-03-11 03:23 UTC: That `1189` branch is no longer considered a valid final answer because it is materially derived from upstream PR `#35` and no longer beats the live upstream best of `1149`.
 - Current milestone: replace the disqualified PR35-derived branch with an original kernel that beats `1149`; the current leading direction is a depth-5 prefix bucket split rather than more shallow preload experiments.
+- 2026-03-11 05:32 UTC: A new original shallow-cache prototype is now checkpointed at `2411` cycles. It is correct, but it only trims `14` cycles from the clean `2425` branch and does not change the strategic direction: shallow-only caching is not enough.
 
 ## Milestone 1 — Baseline And Constraints
 
@@ -30,6 +31,7 @@ Gate status:
 - `done` — implemented the first redesign and validated correctness.
 - `done` — current redesign improves the benchmark materially to `2425` cycles.
 - `in_progress` — next redesign step still needed for the remaining node-access bottleneck.
+- `in_progress` — wave-size and scheduler sweeps were flat, so the remaining work is still structural rather than scheduling polish.
 
 ## Milestone 3 — Competitive Result
 
@@ -41,3 +43,4 @@ Success criteria:
 Gate status:
 - `in_progress` — current fork PR branch beats `1487` but fails the originality / best-upstream bar.
 - `in_progress` — independent rewrite branch started from original commit `ca5bfd5`.
+- `in_progress` — latest independent checkpoint `18a4d28` proves a shallow reclaimed-workspace cache is correct but too small a win, so the next attempt still needs a coarser regrouping idea.

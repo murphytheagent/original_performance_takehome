@@ -34,6 +34,13 @@
 - Depth-specialized shallow rounds that avoid generic lane gathers where the active node set is tiny.
   - 2026-03-11 03:47 UTC: a fresh `vselect`-tree rewrite for depths `0` through `3` stayed correct but regressed to `2725` cycles because it saturates the single `flow` slot.
   - 2026-03-11 04:08 UTC: replacing those `vselect` trees with ALU mask-blends also stayed correct but still regressed to `2673` cycles once scratch pressure forced smaller compile-time waves.
+  - 2026-03-11 05:28 UTC: using reclaimed input memory as a runtime shallow-cache workspace improved only to `2411` cycles. The depth-2 cached round became much cheaper, but the depth-0/depth-1 cache-build rounds mostly paid the savings back. This rules out another shallow-only variant.
 - Coarse regrouping that is amortized across several later rounds, rather than bucketizing on every round.
   - Current preferred plan is a depth-5 prefix split: shared top-tree work for rounds `0` through `4`, one radix scatter into 32 buckets, cheap bucket-local rounds while each bucket fans out only `1/2/4/8`, then honest gathers only for the last deep levels before reset.
 - Better overlap on the remaining gathered rounds, but only as a secondary optimization because it cannot bridge the whole gap to `1149` by itself.
+  - 2026-03-11 05:00 UTC: explicit sweeps over wave width (`16..23`) and more aggressive critical-path scheduling on the original `2425` branch did not move the number at all. The gather line is load-bound, not scheduler-bound.
+
+## Additional constraints learned during the rewrite
+
+- The current `build_mem_image()` layout does not leave any usable tail slack after the input values slice assignment, so the only safe runtime workspace in the submission harness is the reclaimed `inp_indices` plus `inp_values` regions (`512` words total once values are scratch-resident).
+- A shallow-table or shallow-cache scheme can improve specific rounds, but with only `512` words of runtime workspace it cannot scale far enough beyond depths `1` and `2` to threaten the upstream `1149` result.
