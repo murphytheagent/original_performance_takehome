@@ -39,8 +39,17 @@
   - Current preferred plan is a depth-5 prefix split: shared top-tree work for rounds `0` through `4`, one radix scatter into 32 buckets, cheap bucket-local rounds while each bucket fans out only `1/2/4/8`, then honest gathers only for the last deep levels before reset.
 - Better overlap on the remaining gathered rounds, but only as a secondary optimization because it cannot bridge the whole gap to `1149` by itself.
   - 2026-03-11 05:00 UTC: explicit sweeps over wave width (`16..23`) and more aggressive critical-path scheduling on the original `2425` branch did not move the number at all. The gather line is load-bound, not scheduler-bound.
+  - 2026-03-11 06:13 UTC: a corrected bucket-split viability study ruled out the most tempting regrouping variants before full implementation. Real prefix statistics on 400 random seeds were:
+    - split after 2 branch bits: mean max bucket `72.6`, mean mixed boundary blocks `2.6`, mean homogeneous full blocks `29.4 / 32`
+    - split after 3 branch bits: mean max bucket `40.3`, mean mixed boundary blocks `6.2`, mean homogeneous full blocks `25.9 / 32`
+    - split after 4 or 5 bits: too fragmented to justify the reshuffle cost
+  - 2026-03-11 06:13 UTC: corrected round-cost probes on the current kernel show why even the 2-bit/3-bit bucket splits are weak. With setup/store isolated by a `rounds=0` run, the current `256`-wide kernel costs about `70` cycles for depth `0`, `118` for the 2-way table round, `160` for the current 4-way table round, and `154..160` for generic gathered rounds. That means a 2-bit split only has one clearly cheaper replacement round (`118` versus `160`), while the current 4-way table is already basically as expensive as a gather round.
+  - 2026-03-11 06:13 UTC: a one-shot proxy harness on smaller batch widths confirmed that per-bucket sequential execution is not viable. On the same height-10 tree, a `64`-wide kernel costs `91` cycles with `0` rounds, then `109/140/181/226/271/316` cycles for `1..6` rounds. Four such bucket-local passes are already slower than the current unified `256`-wide kernel before paying any bucket scatter / final restore cost.
+- Block-local unique-address dedup on the earliest gathered rounds.
+  - 2026-03-11 06:13 UTC: an additional Athena review suggested a representative-lane dedup only for the first gathered rounds (especially depth `3`), trading repeated per-lane loads for scalar ALU copies. The useful conclusion is the scale, not the exact mechanism: even the optimistic upside looks more like `~100` cycles than `~1000`, so this family may still be worth a small pilot but not as a likely direct path to beating `1149`.
 
 ## Additional constraints learned during the rewrite
 
 - The current `build_mem_image()` layout does not leave any usable tail slack after the input values slice assignment, so the only safe runtime workspace in the submission harness is the reclaimed `inp_indices` plus `inp_values` regions (`512` words total once values are scratch-resident).
 - A shallow-table or shallow-cache scheme can improve specific rounds, but with only `512` words of runtime workspace it cannot scale far enough beyond depths `1` and `2` to threaten the upstream `1149` result.
+- `do_kernel_test()` in `perf_takehome.py` is only a valid incremental checker for paused scalar kernels. Vector kernels run to completion on the first `machine.run()`, so smaller-shape proxy measurements must use a one-shot submission-style harness instead of that helper.
