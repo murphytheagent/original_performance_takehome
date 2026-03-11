@@ -2,10 +2,10 @@
 
 ## Current Status
 
-- 2026-03-11 02:32 UTC: Current best verified result is `1149` cycles on `python tests/submission_tests.py`, down from the starter `147734`.
-- 2026-03-11 02:48 UTC: the branch now keeps the `1149` submission-harness result while falling back to a safe scalar kernel for unsupported batch shapes (for example non-`8`-multiple tails or larger divisible batches that would overflow scratch).
-- 2026-03-11 02:48 UTC: benchmarked nearby public/local branches; none beat `1149` (`pr29` was the closest at `1158`).
-- Current milestone: the target is beaten, hardened for general repo usage, and still locally frontier-best. Remaining loop time can go to deeper simplification or an even lower cycle search.
+- 2026-03-11 03:04 UTC: Current delivered result is `1189` cycles on `python tests/submission_tests.py`, down from the starter `147734`.
+- 2026-03-11 03:04 UTC: the branch now uses a runtime zero-index guard: generated inputs still take the vector fast path, while arbitrary starting indices jump to the scalar kernel for correctness.
+- 2026-03-11 03:04 UTC: targeted validation now passes for empty batches, non-`8`-multiple tails, larger divisible batches that would overflow scratch, and arbitrary nonzero starting-index patterns.
+- Current milestone: the target is still beaten with margin, and the remaining loop time can go either to reclaiming some of the `40` guard cycles or to finding a cleaner fully general fast path.
 
 ## Milestone 1 — Baseline And Constraints
 
@@ -29,7 +29,7 @@ Success criteria:
 Gate status:
 - `done` — selected and documented a vectorized scratch-resident baseline and then the stronger shallow-specialized design.
 - `done` — implemented the redesign and validated correctness.
-- `done` — the benchmark is improved materially, from `147734` cycles to `1149`.
+- `done` — the benchmark is improved materially, from `147734` cycles to `1189`.
 - `done` — the remaining node-access bottleneck is resolved well enough to clear the target.
 
 ## Milestone 3 — Competitive Result
@@ -39,6 +39,6 @@ Success criteria:
 - Result is checkpointed in git and summarized in the task report.
 
 Gate status:
-- `done` — the kernel beats `1487` at `1149` cycles without touching `tests/`.
+- `done` — the kernel beats `1487` at `1189` cycles without touching `tests/`.
 - `done` — the result is checkpointed in git and summarized in the task report.
-- `done` — the delivered branch preserves correctness for unsupported batch shapes via a fallback path without perturbing the target benchmark.
+- `done` — the delivered branch preserves correctness for unsupported batch shapes and arbitrary starting indices via explicit runtime/scalar fallback paths.

@@ -318,15 +318,16 @@ class KernelBuilder:
     def build_kernel(self, forest_height, n_nodes, batch_size, rounds,
                      group_size=17, round_tile=14, mini_batch=1):
         # The fast vector kernel is tuned for the frozen submission shape.
-        # Fall back to a scalar kernel when the batch shape is unsupported or
-        # when scratch use would exceed the machine budget.
+        # Fall back to the scalar kernel when the batch shape is unsupported,
+        # when scratch use would exceed the machine budget, or when the input
+        # indices are not the generated all-zero root state.
         if batch_size % VLEN != 0:
             self._build_scalar_kernel(forest_height, n_nodes, batch_size, rounds)
             return
 
-        probe = type(self)()
+        fast = type(self)()
         try:
-            probe._build_fast_kernel(
+            fast._build_fast_kernel(
                 forest_height,
                 n_nodes,
                 batch_size,
@@ -339,7 +340,61 @@ class KernelBuilder:
             self._build_scalar_kernel(forest_height, n_nodes, batch_size, rounds)
             return
 
-        self._adopt_builder(probe)
+        scalar = type(self)()
+        scalar._build_scalar_kernel(forest_height, n_nodes, batch_size, rounds)
+        self._build_guarded_kernel(fast, scalar, n_nodes, batch_size)
+
+    def _build_guarded_kernel(self, fast, scalar, n_nodes, batch_size):
+        self._adopt_builder(fast)
+        fast_instrs = list(self.instrs)
+
+        self.scratch_ptr = max(fast.scratch_ptr, scalar.scratch_ptr)
+        guard_slots = []
+
+        guard_idx_addr = self.alloc_scratch("guard_idx_addr")
+        guard_offset = self.alloc_scratch("guard_offset")
+        guard_any_nonzero = self.alloc_scratch("guard_any_nonzero")
+        guard_reduce = self.alloc_scratch("guard_reduce")
+        guard_or = self.alloc_vec("guard_or")
+        guard_tmp = self.alloc_vec("guard_tmp")
+
+        inp_indices_p = self.scratch_const(7 + n_nodes, "guard_inp_indices_p", guard_slots)
+        vlen_const = self.scratch_const(VLEN, slots=guard_slots)
+        zero_vec = self.scratch_vconst(0, "guard_zero_vec", guard_slots)
+
+        guard_slots.append(("load", ("const", guard_offset, 0)))
+        guard_slots.append(("valu", ("+", guard_or, zero_vec, zero_vec)))
+
+        blocks_per_round = batch_size // VLEN
+        for block in range(blocks_per_round):
+            guard_slots.append(("alu", ("+", guard_idx_addr, inp_indices_p, guard_offset)))
+            guard_slots.append(("load", ("vload", guard_tmp, guard_idx_addr)))
+            guard_slots.append(("valu", ("|", guard_or, guard_or, guard_tmp)))
+            if block < blocks_per_round - 1:
+                guard_slots.append(("alu", ("+", guard_offset, guard_offset, vlen_const)))
+
+        guard_slots.append(("alu", ("|", guard_idx_addr, guard_or + 0, guard_or + 1)))
+        guard_slots.append(("alu", ("|", guard_offset, guard_or + 2, guard_or + 3)))
+        guard_slots.append(("alu", ("|", guard_any_nonzero, guard_or + 4, guard_or + 5)))
+        guard_slots.append(("alu", ("|", guard_reduce, guard_or + 6, guard_or + 7)))
+        guard_slots.append(("alu", ("|", guard_idx_addr, guard_idx_addr, guard_offset)))
+        guard_slots.append(("alu", ("|", guard_any_nonzero, guard_any_nonzero, guard_reduce)))
+        guard_slots.append(("alu", ("|", guard_any_nonzero, guard_idx_addr, guard_any_nonzero)))
+
+        preamble = _schedule_slots(guard_slots)
+        scalar_start = len(preamble) + 1 + len(fast_instrs) + 1
+        end_pc = scalar_start + len(scalar.instrs)
+
+        self.instrs = list(preamble)
+        self.instrs.append({"flow": [("cond_jump", guard_any_nonzero, scalar_start)]})
+        self.instrs.extend(fast_instrs)
+        self.instrs.append({"flow": [("jump", end_pc)]})
+        self.instrs.extend(scalar.instrs)
+
+        for addr, info in scalar.scratch_debug.items():
+            self.scratch_debug.setdefault(addr, info)
+        for name, addr in scalar.scratch.items():
+            self.scratch.setdefault(name, addr)
 
     def _build_fast_kernel(self, forest_height, n_nodes, batch_size, rounds,
                            group_size=17, round_tile=14, mini_batch=1):
