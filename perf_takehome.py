@@ -202,10 +202,11 @@ class KernelBuilder:
             node = self.wave_node[local_group]
             tmp1 = self.wave_tmp1[local_group]
             tmp2 = self.wave_tmp2[local_group]
+            tmp3 = self.wave_tmp3[local_group]
             node_deps = []
             if depth == 0:
                 node_src = self.root_vec
-            elif depth in (1, 2):
+            elif depth in (1, 2, 3):
                 assert use_cached_nodes, "shallow rounds should use cached node vectors"
                 node_src = node
             else:
@@ -430,6 +431,88 @@ class KernelBuilder:
                         local_group,
                         18,
                     )
+            elif depth == 2 and self.forest_height >= 3:
+                lo01_id = add_op(
+                    "valu",
+                    ("&", tmp1, path, self.one_vec),
+                    [next_path_id],
+                    local_group,
+                    14,
+                )
+                mid01_id = add_op(
+                    "valu",
+                    ("&", tmp2, path, self.two_vec),
+                    [next_path_id],
+                    local_group,
+                    14,
+                    1,
+                )
+                hi_id = add_op(
+                    "valu",
+                    ("&", tmp3, path, self.four_vec),
+                    [next_path_id],
+                    local_group,
+                    14,
+                    2,
+                )
+                pair01_id = add_op(
+                    "flow",
+                    ("vselect", node, tmp1, self.depth3_nodes[1], self.depth3_nodes[0]),
+                    [lo01_id],
+                    local_group,
+                    15,
+                )
+                pair23_id = add_op(
+                    "flow",
+                    ("vselect", addr, tmp1, self.depth3_nodes[3], self.depth3_nodes[2]),
+                    [lo01_id],
+                    local_group,
+                    16,
+                )
+                upper_half0_id = add_op(
+                    "flow",
+                    ("vselect", node, tmp2, addr, node),
+                    [mid01_id, pair01_id, pair23_id],
+                    local_group,
+                    17,
+                )
+                pair45_id = add_op(
+                    "flow",
+                    ("vselect", addr, tmp1, self.depth3_nodes[5], self.depth3_nodes[4]),
+                    [upper_half0_id],
+                    local_group,
+                    18,
+                )
+                pair67_id = add_op(
+                    "flow",
+                    ("vselect", tmp2, tmp1, self.depth3_nodes[7], self.depth3_nodes[6]),
+                    [upper_half0_id],
+                    local_group,
+                    19,
+                )
+                mid23_id = add_op(
+                    "valu",
+                    ("&", tmp1, path, self.two_vec),
+                    [pair45_id, pair67_id],
+                    local_group,
+                    20,
+                )
+                upper_half1_id = add_op(
+                    "flow",
+                    ("vselect", addr, tmp1, tmp2, addr),
+                    [mid23_id, pair45_id, pair67_id],
+                    local_group,
+                    21,
+                )
+                table_id = add_op(
+                    "flow",
+                    ("vselect", node, tmp3, addr, node),
+                    [hi_id, upper_half0_id, upper_half1_id],
+                    local_group,
+                    22,
+                )
+                if cache_next_nodes:
+                    carry_deps.append(table_id)
 
             next_state_deps.append(carry_deps)
 
@@ -481,11 +564,12 @@ class KernelBuilder:
         inp_indices_p = forest_values_p + n_nodes
         inp_values_p = inp_indices_p + batch_size
         n_blocks = batch_size // VLEN
-        wave_size = min(18, n_blocks)
+        wave_size = min(16, n_blocks)
 
         self.zero_vec = self.scratch_vconst(0, "zero_vec")
         self.one_vec = self.scratch_vconst(1, "one_vec")
         self.two_vec = self.scratch_vconst(2, "two_vec")
+        self.four_vec = self.scratch_vconst(4, "four_vec")
         self.mul_4097_vec = self.scratch_vconst(4097, "mul_4097_vec")
         self.mul_33_vec = self.scratch_vconst(33, "mul_33_vec")
         self.mul_9_vec = self.scratch_vconst(9, "mul_9_vec")
@@ -501,7 +585,7 @@ class KernelBuilder:
         self.pair_stride = self.scratch_const(VLEN * 2, "pair_stride")
 
         self.base_vecs = {}
-        for depth in range(1, forest_height + 1):
+        for depth in range(4, forest_height + 1):
             self.base_vecs[depth] = self.scratch_vconst(
                 forest_values_p + (1 << depth) - 1, f"base_vec_{depth}"
             )
@@ -524,9 +608,12 @@ class KernelBuilder:
         self.wave_tmp2 = [
             self.alloc_scratch(f"wave_tmp2_{i}", VLEN) for i in range(wave_size)
         ]
+        self.wave_tmp3 = [
+            self.alloc_scratch(f"wave_tmp3_{i}", VLEN) for i in range(wave_size)
+        ]
         preload_scalar = self.alloc_scratch("preload_scalar")
         shallow_nodes = {}
-        for node_idx in range(7):
+        for node_idx in range(15):
             node_addr = self.scratch_const(
                 forest_values_p + node_idx, f"shallow_node_addr_{node_idx}"
             )
@@ -542,6 +629,7 @@ class KernelBuilder:
         self.depth2_left_alt_vec = shallow_nodes[4]
         self.depth2_right_base_vec = shallow_nodes[5]
         self.depth2_right_alt_vec = shallow_nodes[6]
+        self.depth3_nodes = [shallow_nodes[node_idx] for node_idx in range(7, 15)]
 
         value_addr0 = self.alloc_scratch("value_addr0")
         value_addr1 = self.alloc_scratch("value_addr1")
@@ -573,8 +661,8 @@ class KernelBuilder:
                     {
                         "depth": depth,
                         "is_final": remaining_rounds == offset + 1,
-                        "use_cached_nodes": depth in (1, 2),
-                        "cache_next_nodes": depth in (0, 1) and offset + 1 < fused_rounds,
+                        "use_cached_nodes": depth in (1, 2, 3),
+                        "cache_next_nodes": depth in (0, 1, 2) and offset + 1 < fused_rounds,
                     }
                 )
 
