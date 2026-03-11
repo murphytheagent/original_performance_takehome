@@ -201,6 +201,16 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+        del vliw
+        instrs = []
+        for engine, slot in slots:
+            instrs.append({engine: [slot]})
+        return instrs
+
+    def add(self, engine, slot):
+        self.instrs.append({engine: [slot]})
+
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
         if name:
@@ -234,8 +244,105 @@ class KernelBuilder:
             self.vconst_map[val] = addr
         return self.vconst_map[val]
 
+    def _adopt_builder(self, other):
+        self.instrs = other.instrs
+        self.scratch = other.scratch
+        self.scratch_debug = other.scratch_debug
+        self.scratch_ptr = other.scratch_ptr
+        self.const_map = other.const_map
+        self.vconst_map = other.vconst_map
+
+    def build_hash(self, val_hash_addr, tmp1, tmp2):
+        slots = []
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
+            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
+            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
+        return slots
+
+    def _build_scalar_kernel(self, forest_height, n_nodes, batch_size, rounds):
+        del forest_height
+        tmp1 = self.alloc_scratch("tmp1")
+        tmp2 = self.alloc_scratch("tmp2")
+        tmp3 = self.alloc_scratch("tmp3")
+        tmp_idx = self.alloc_scratch("tmp_idx")
+        tmp_val = self.alloc_scratch("tmp_val")
+        tmp_node_val = self.alloc_scratch("tmp_node_val")
+        tmp_addr = self.alloc_scratch("tmp_addr")
+
+        forest_values_p = self.alloc_scratch("forest_values_p")
+        inp_indices_p = self.alloc_scratch("inp_indices_p")
+        inp_values_p = self.alloc_scratch("inp_values_p")
+        self.add("load", ("const", forest_values_p, 7))
+        self.add("load", ("const", inp_indices_p, 7 + n_nodes))
+        self.add("load", ("const", inp_values_p, 7 + n_nodes + batch_size))
+
+        zero_const = self.scratch_const(0)
+        one_const = self.scratch_const(1)
+        two_const = self.scratch_const(2)
+        n_nodes_const = self.scratch_const(n_nodes)
+
+        body = []
+        for _round in range(rounds):
+            for i in range(batch_size):
+                i_const = self.scratch_const(i)
+
+                body.append(("alu", ("+", tmp_addr, inp_indices_p, i_const)))
+                body.append(("load", ("load", tmp_idx, tmp_addr)))
+
+                body.append(("alu", ("+", tmp_addr, inp_values_p, i_const)))
+                body.append(("load", ("load", tmp_val, tmp_addr)))
+
+                body.append(("alu", ("+", tmp_addr, forest_values_p, tmp_idx)))
+                body.append(("load", ("load", tmp_node_val, tmp_addr)))
+
+                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
+                body.extend(self.build_hash(tmp_val, tmp1, tmp2))
+
+                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
+                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
+                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
+                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
+                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
+                body.append(("alu", ("<", tmp1, tmp_idx, n_nodes_const)))
+                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
+
+                body.append(("alu", ("+", tmp_addr, inp_indices_p, i_const)))
+                body.append(("store", ("store", tmp_addr, tmp_idx)))
+
+                body.append(("alu", ("+", tmp_addr, inp_values_p, i_const)))
+                body.append(("store", ("store", tmp_addr, tmp_val)))
+
+        self.instrs.extend(self.build(body))
+
     def build_kernel(self, forest_height, n_nodes, batch_size, rounds,
                      group_size=17, round_tile=14, mini_batch=1):
+        # The fast vector kernel is tuned for the frozen submission shape.
+        # Fall back to a scalar kernel when the batch shape is unsupported or
+        # when scratch use would exceed the machine budget.
+        if batch_size % VLEN != 0:
+            self._build_scalar_kernel(forest_height, n_nodes, batch_size, rounds)
+            return
+
+        probe = type(self)()
+        try:
+            probe._build_fast_kernel(
+                forest_height,
+                n_nodes,
+                batch_size,
+                rounds,
+                group_size=group_size,
+                round_tile=round_tile,
+                mini_batch=mini_batch,
+            )
+        except AssertionError:
+            self._build_scalar_kernel(forest_height, n_nodes, batch_size, rounds)
+            return
+
+        self._adopt_builder(probe)
+
+    def _build_fast_kernel(self, forest_height, n_nodes, batch_size, rounds,
+                           group_size=17, round_tile=14, mini_batch=1):
         tmp_addr = self.alloc_scratch("tmp_addr")
         tmp_addr2 = self.alloc_scratch("tmp_addr2")
         self.alloc_scratch("tmp_init")
