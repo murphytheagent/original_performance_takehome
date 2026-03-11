@@ -44,6 +44,7 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.vector_const_map = {}
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -57,6 +58,14 @@ class KernelBuilder:
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
+
+    def emit(self, **engines):
+        instr = {}
+        for engine, slots in engines.items():
+            if slots:
+                instr[engine] = list(slots)
+        if instr:
+            self.instrs.append(instr)
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -74,6 +83,316 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
+    def scratch_vconst(self, val, name=None):
+        if val not in self.vector_const_map:
+            scalar = self.scratch_const(val, None if name is None else f"{name}_scalar")
+            addr = self.alloc_scratch(name, VLEN)
+            self.emit(valu=[("vbroadcast", addr, scalar)])
+            self.vector_const_map[val] = addr
+        return self.vector_const_map[val]
+
+    def _schedule_ops(self, ops):
+        by_id = {op["id"]: op for op in ops}
+        remaining = set(by_id)
+        done = set()
+        while remaining:
+            instr = {}
+            cycle_done = set(done)
+            completed_this_cycle = []
+            for engine in ("alu", "valu", "load", "store", "flow"):
+                limit = SLOT_LIMITS[engine]
+                ready = [
+                    by_id[op_id]
+                    for op_id in remaining
+                    if by_id[op_id]["engine"] == engine
+                    and all(dep in cycle_done for dep in by_id[op_id]["deps"])
+                ]
+                ready.sort(
+                    key=lambda op: (
+                        op["stage"],
+                        op["group"],
+                        op["priority"],
+                        op["id"],
+                    )
+                )
+                picked = ready[:limit]
+                if picked:
+                    instr[engine] = [op["slot"] for op in picked]
+                    for op in picked:
+                        remaining.remove(op["id"])
+                        completed_this_cycle.append(op["id"])
+            assert instr, "Scheduler stalled on a cyclic dependency graph"
+            done.update(completed_this_cycle)
+            self.instrs.append(instr)
+
+    def _build_vector_wave(self, groups, depth, is_final):
+        ops = []
+        next_id = 0
+
+        def add_op(engine, slot, deps, group, stage, priority=0):
+            nonlocal next_id
+            op_id = next_id
+            next_id += 1
+            ops.append(
+                {
+                    "id": op_id,
+                    "engine": engine,
+                    "slot": slot,
+                    "deps": list(deps),
+                    "group": group,
+                    "stage": stage,
+                    "priority": priority,
+                }
+            )
+            return op_id
+
+        for local_group, block in enumerate(groups):
+            val = self.value_blocks[block]
+            path = self.path_blocks[block]
+            addr = self.wave_addr[local_group]
+            node = self.wave_node[local_group]
+            tmp1 = self.wave_tmp1[local_group]
+            tmp2 = self.wave_tmp2[local_group]
+            node_deps = []
+            if depth == 0:
+                node_src = self.root_vec
+            else:
+                addr_id = add_op(
+                    "valu",
+                    ("+", addr, path, self.base_vecs[depth]),
+                    [],
+                    local_group,
+                    0,
+                )
+                for lane in range(VLEN):
+                    node_deps.append(
+                        add_op(
+                            "load",
+                            ("load_offset", node, addr, lane),
+                            [addr_id],
+                            local_group,
+                            1,
+                            lane,
+                        )
+                    )
+                node_src = node
+
+            xor_id = add_op(
+                "valu",
+                ("^", val, val, node_src),
+                node_deps,
+                local_group,
+                2,
+            )
+            stage0_id = add_op(
+                "valu",
+                ("multiply_add", val, val, self.mul_4097_vec, self.hash_add0_vec),
+                [xor_id],
+                local_group,
+                3,
+            )
+            stage1_left = add_op(
+                "valu",
+                ("^", tmp1, val, self.hash_xor1_vec),
+                [stage0_id],
+                local_group,
+                4,
+            )
+            stage1_right = add_op(
+                "valu",
+                (">>", tmp2, val, self.shift_19_vec),
+                [stage0_id],
+                local_group,
+                4,
+                1,
+            )
+            stage1_merge = add_op(
+                "valu",
+                ("^", val, tmp1, tmp2),
+                [stage1_left, stage1_right],
+                local_group,
+                5,
+            )
+            stage2_id = add_op(
+                "valu",
+                ("multiply_add", val, val, self.mul_33_vec, self.hash_add2_vec),
+                [stage1_merge],
+                local_group,
+                6,
+            )
+            stage3_left = add_op(
+                "valu",
+                ("+", tmp1, val, self.hash_add3_vec),
+                [stage2_id],
+                local_group,
+                7,
+            )
+            stage3_right = add_op(
+                "valu",
+                ("<<", tmp2, val, self.shift_9_vec),
+                [stage2_id],
+                local_group,
+                7,
+                1,
+            )
+            stage3_merge = add_op(
+                "valu",
+                ("^", val, tmp1, tmp2),
+                [stage3_left, stage3_right],
+                local_group,
+                8,
+            )
+            stage4_id = add_op(
+                "valu",
+                ("multiply_add", val, val, self.mul_9_vec, self.hash_add4_vec),
+                [stage3_merge],
+                local_group,
+                9,
+            )
+            stage5_left = add_op(
+                "valu",
+                ("^", tmp1, val, self.hash_xor5_vec),
+                [stage4_id],
+                local_group,
+                10,
+            )
+            stage5_right = add_op(
+                "valu",
+                (">>", tmp2, val, self.shift_16_vec),
+                [stage4_id],
+                local_group,
+                10,
+                1,
+            )
+            hash_done = add_op(
+                "valu",
+                ("^", val, tmp1, tmp2),
+                [stage5_left, stage5_right],
+                local_group,
+                11,
+            )
+
+            if is_final or depth == self.forest_height:
+                continue
+
+            parity_id = add_op(
+                "valu",
+                ("&", addr, val, self.one_vec),
+                [hash_done],
+                local_group,
+                12,
+            )
+            if depth == 0:
+                add_op(
+                    "valu",
+                    ("+", path, addr, self.zero_vec),
+                    [parity_id],
+                    local_group,
+                    13,
+                )
+            else:
+                add_op(
+                    "valu",
+                    ("multiply_add", path, path, self.two_vec, addr),
+                    [parity_id],
+                    local_group,
+                    13,
+                )
+
+        self._schedule_ops(ops)
+
+    def _build_vector_kernel(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+    ):
+        self.forest_height = forest_height
+        forest_values_p = 7
+        inp_indices_p = forest_values_p + n_nodes
+        inp_values_p = inp_indices_p + batch_size
+        n_blocks = batch_size // VLEN
+        wave_size = min(16, n_blocks)
+
+        self.zero_vec = self.scratch_vconst(0, "zero_vec")
+        self.one_vec = self.scratch_vconst(1, "one_vec")
+        self.two_vec = self.scratch_vconst(2, "two_vec")
+        self.mul_4097_vec = self.scratch_vconst(4097, "mul_4097_vec")
+        self.mul_33_vec = self.scratch_vconst(33, "mul_33_vec")
+        self.mul_9_vec = self.scratch_vconst(9, "mul_9_vec")
+        self.hash_add0_vec = self.scratch_vconst(HASH_STAGES[0][1], "hash_add0_vec")
+        self.hash_xor1_vec = self.scratch_vconst(HASH_STAGES[1][1], "hash_xor1_vec")
+        self.hash_add2_vec = self.scratch_vconst(HASH_STAGES[2][1], "hash_add2_vec")
+        self.hash_add3_vec = self.scratch_vconst(HASH_STAGES[3][1], "hash_add3_vec")
+        self.hash_add4_vec = self.scratch_vconst(HASH_STAGES[4][1], "hash_add4_vec")
+        self.hash_xor5_vec = self.scratch_vconst(HASH_STAGES[5][1], "hash_xor5_vec")
+        self.shift_19_vec = self.scratch_vconst(HASH_STAGES[1][4], "shift_19_vec")
+        self.shift_9_vec = self.scratch_vconst(HASH_STAGES[3][4], "shift_9_vec")
+        self.shift_16_vec = self.scratch_vconst(HASH_STAGES[5][4], "shift_16_vec")
+
+        self.base_vecs = {}
+        for depth in range(1, forest_height + 1):
+            self.base_vecs[depth] = self.scratch_vconst(
+                forest_values_p + (1 << depth) - 1, f"base_vec_{depth}"
+            )
+
+        self.value_blocks = [
+            self.alloc_scratch(f"value_block_{block}", VLEN) for block in range(n_blocks)
+        ]
+        self.path_blocks = [
+            self.alloc_scratch(f"path_block_{block}", VLEN) for block in range(n_blocks)
+        ]
+        self.wave_addr = [
+            self.alloc_scratch(f"wave_addr_{i}", VLEN) for i in range(wave_size)
+        ]
+        self.wave_node = [
+            self.alloc_scratch(f"wave_node_{i}", VLEN) for i in range(wave_size)
+        ]
+        self.wave_tmp1 = [
+            self.alloc_scratch(f"wave_tmp1_{i}", VLEN) for i in range(wave_size)
+        ]
+        self.wave_tmp2 = [
+            self.alloc_scratch(f"wave_tmp2_{i}", VLEN) for i in range(wave_size)
+        ]
+        root_addr = self.scratch_const(forest_values_p, "root_addr")
+        root_scalar = self.alloc_scratch("root_scalar")
+        self.root_vec = self.alloc_scratch("root_vec", VLEN)
+        self.emit(load=[("load", root_scalar, root_addr)])
+        self.emit(valu=[("vbroadcast", self.root_vec, root_scalar)])
+
+        value_addr_consts = [
+            self.scratch_const(inp_values_p + block * VLEN, f"value_addr_{block}")
+            for block in range(n_blocks)
+        ]
+
+        for block in range(0, n_blocks, 2):
+            load_slots = [("vload", self.value_blocks[block], value_addr_consts[block])]
+            if block + 1 < n_blocks:
+                load_slots.append(
+                    ("vload", self.value_blocks[block + 1], value_addr_consts[block + 1])
+                )
+            self.emit(load=load_slots)
+
+        self.emit(flow=[("pause",)])
+        for round_idx in range(rounds):
+            depth = round_idx % (forest_height + 1)
+            is_final = round_idx == rounds - 1
+            for block in range(0, n_blocks, wave_size):
+                groups = list(range(block, min(block + wave_size, n_blocks)))
+                self._build_vector_wave(groups, depth, is_final)
+
+        for block in range(0, n_blocks, 2):
+            store_slots = [
+                ("vstore", value_addr_consts[block], self.value_blocks[block])
+            ]
+            if block + 1 < n_blocks:
+                store_slots.append(
+                    (
+                        "vstore",
+                        value_addr_consts[block + 1],
+                        self.value_blocks[block + 1],
+                    )
+                )
+            self.emit(store=store_slots)
+        self.emit(flow=[("pause",)])
+
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
 
@@ -85,7 +404,7 @@ class KernelBuilder:
 
         return slots
 
-    def build_kernel(
+    def _build_scalar_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
@@ -172,6 +491,14 @@ class KernelBuilder:
         self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
+
+    def build_kernel(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+    ):
+        if N_CORES == 1 and batch_size % VLEN == 0:
+            self._build_vector_kernel(forest_height, n_nodes, batch_size, rounds)
+        else:
+            self._build_scalar_kernel(forest_height, n_nodes, batch_size, rounds)
 
 BASELINE = 147734
 
