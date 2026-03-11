@@ -16,7 +16,6 @@ anything in the tests/ folder.
 We recommend you look through problem.py next.
 """
 
-from collections import defaultdict
 import random
 import unittest
 
@@ -109,8 +108,8 @@ class KernelBuilder:
                 ]
                 ready.sort(
                     key=lambda op: (
-                        op["stage"],
                         op["group"],
+                        op["stage"],
                         op["priority"],
                         op["id"],
                     )
@@ -128,17 +127,20 @@ class KernelBuilder:
             done.update(completed_this_cycle)
             self.instrs.append(instr)
 
-    def _build_vector_wave(
+    def _append_vector_round_ops(
         self,
+        ops,
+        next_id,
         groups,
         depth,
         is_final,
         *,
         use_cached_nodes=False,
         cache_next_nodes=False,
+        state_deps=None,
     ):
-        ops = []
-        next_id = 0
+        if state_deps is None:
+            state_deps = [[] for _ in groups]
 
         def add_op(engine, slot, deps, group, stage, priority=0):
             nonlocal next_id
@@ -182,7 +184,9 @@ class KernelBuilder:
                 stage + 1,
             )
 
+        next_state_deps = []
         for local_group, block in enumerate(groups):
+            round_start = list(state_deps[local_group])
             val = self.value_blocks[block]
             path = self.path_blocks[block]
             addr = self.wave_addr[local_group]
@@ -199,7 +203,7 @@ class KernelBuilder:
                 addr_id = add_op(
                     "valu",
                     ("+", addr, path, self.base_vecs[depth]),
-                    [],
+                    round_start,
                     local_group,
                     0,
                 )
@@ -219,7 +223,7 @@ class KernelBuilder:
             xor_id = add_op(
                 "valu",
                 ("^", val, val, node_src),
-                node_deps,
+                round_start + node_deps,
                 local_group,
                 2,
             )
@@ -312,6 +316,7 @@ class KernelBuilder:
             )
 
             if is_final or depth == self.forest_height:
+                next_state_deps.append([hash_done])
                 continue
 
             parity_id = add_op(
@@ -338,6 +343,7 @@ class KernelBuilder:
                     13,
                 )
 
+            carry_deps = [hash_done, next_path_id]
             if depth == 0 and self.forest_height >= 1:
                 mask_id = add_bit_mask(
                     addr,
@@ -362,7 +368,9 @@ class KernelBuilder:
                     local_group,
                     17,
                 )
-                if not cache_next_nodes:
+                if cache_next_nodes:
+                    carry_deps.append(table_id)
+                else:
                     add_op(
                         "store",
                         ("vstore", self.depth1_table_addrs[block], node),
@@ -440,7 +448,9 @@ class KernelBuilder:
                     local_group,
                     21,
                 )
-                if not cache_next_nodes:
+                if cache_next_nodes:
+                    carry_deps.append(table_id)
+                else:
                     add_op(
                         "store",
                         ("vstore", self.depth2_table_addrs[block], node),
@@ -449,33 +459,46 @@ class KernelBuilder:
                         22,
                     )
 
+            next_state_deps.append(carry_deps)
+
+        return next_id, next_state_deps
+
+    def _build_vector_round_sequence(self, groups, round_specs):
+        ops = []
+        next_id = 0
+        state_deps = [[] for _ in groups]
+        for round_spec in round_specs:
+            next_id, state_deps = self._append_vector_round_ops(
+                ops,
+                next_id,
+                groups,
+                round_spec["depth"],
+                round_spec["is_final"],
+                use_cached_nodes=round_spec.get("use_cached_nodes", False),
+                cache_next_nodes=round_spec.get("cache_next_nodes", False),
+                state_deps=state_deps,
+            )
         self._schedule_ops(ops)
 
-    def _build_fused_shallow_wave(self, groups, fused_rounds, remaining_rounds):
-        self._build_vector_wave(
+    def _build_vector_wave(
+        self,
+        groups,
+        depth,
+        is_final,
+        *,
+        use_cached_nodes=False,
+        cache_next_nodes=False,
+    ):
+        self._build_vector_round_sequence(
             groups,
-            0,
-            remaining_rounds == 1,
-            cache_next_nodes=fused_rounds > 1,
-        )
-        if fused_rounds < 2:
-            return
-
-        self._build_vector_wave(
-            groups,
-            1,
-            remaining_rounds == 2,
-            use_cached_nodes=True,
-            cache_next_nodes=fused_rounds > 2,
-        )
-        if fused_rounds < 3:
-            return
-
-        self._build_vector_wave(
-            groups,
-            2,
-            remaining_rounds == 3,
-            use_cached_nodes=True,
+            [
+                {
+                    "depth": depth,
+                    "is_final": is_final,
+                    "use_cached_nodes": use_cached_nodes,
+                    "cache_next_nodes": cache_next_nodes,
+                }
+            ],
         )
 
     def _build_vector_kernel(
@@ -576,21 +599,24 @@ class KernelBuilder:
 
         round_idx = 0
         while round_idx < rounds:
-            depth = round_idx % (forest_height + 1)
-            if depth == 0:
-                remaining_rounds = rounds - round_idx
-                fused_rounds = min(remaining_rounds, forest_height + 1, 3)
-                for block in range(0, n_blocks, wave_size):
-                    groups = list(range(block, min(block + wave_size, n_blocks)))
-                    self._build_fused_shallow_wave(groups, fused_rounds, remaining_rounds)
-                round_idx += fused_rounds
-                continue
+            remaining_rounds = rounds - round_idx
+            fused_rounds = remaining_rounds
+            round_specs = []
+            for offset in range(fused_rounds):
+                depth = offset % (forest_height + 1)
+                round_specs.append(
+                    {
+                        "depth": depth,
+                        "is_final": remaining_rounds == offset + 1,
+                        "use_cached_nodes": depth in (1, 2),
+                        "cache_next_nodes": depth in (0, 1) and offset + 1 < fused_rounds,
+                    }
+                )
 
-            is_final = round_idx == rounds - 1
             for block in range(0, n_blocks, wave_size):
                 groups = list(range(block, min(block + wave_size, n_blocks)))
-                self._build_vector_wave(groups, depth, is_final)
-            round_idx += 1
+                self._build_vector_round_sequence(groups, round_specs)
+            round_idx += fused_rounds
 
         self.emit(
             load=[

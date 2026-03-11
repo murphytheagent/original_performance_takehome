@@ -1,6 +1,6 @@
 # Project: Original Performance Takehome
 
-Fork of Anthropic's `original_performance_takehome`. Current focus: redesign the kernel in `perf_takehome.py` to beat `1487` cycles without modifying anything under `tests/`.
+Fork of Anthropic's `original_performance_takehome`. Current focus: push the independent kernel rewrite in `perf_takehome.py` below the live upstream best (`1149` as of 2026-03-11 03:21 UTC) without modifying anything under `tests/`.
 
 ## Key Docs
 - `roadmap.md` — milestones, current status, validation gates

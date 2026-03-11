@@ -3,7 +3,7 @@
 ## Baseline
 
 - 2026-03-11 00:49 UTC: `python tests/submission_tests.py` reported `147734` cycles for the starter kernel.
-- 2026-03-11 07:24 UTC: current best verified result on the independent rewrite branch is `2285` cycles.
+- 2026-03-11 07:48 UTC: current best verified result on the independent rewrite branch is `1815` cycles.
 - 2026-03-11 03:21 UTC: live upstream re-audit confirmed the best public result is still `1149` cycles (PR `#35`), with `1158` (PR `#29`) the next-best measured candidate.
 - 2026-03-11 03:23 UTC: the fork PR branch at `1189` cycles is no longer treated as a valid final answer because it is materially PR `#35` plus local hardening.
 - The starter implementation is scalar and emits one slot per instruction bundle, so it leaves both VLIW packing and SIMD unused.
@@ -30,6 +30,8 @@
 - This means generic gather rounds are already fairly close to their access-pattern floor, so the next big win almost certainly has to reduce or amortize node feeding rather than only improving arithmetic scheduling.
 - 2026-03-11 07:24 UTC: a successful independent shallow-wave fusion removed one real source of waste. Keeping the depth-1 and depth-2 node vectors in scratch for a wave, instead of spilling them to memory and reloading them a round later, improved the independent branch from `2411` to `2315`. Removing the dead per-block value-address constant table then improved it again to `2285`.
 - 2026-03-11 07:24 UTC: updated one-shot round costs on the fused branch are `[setup=101, depth0=70, depth1=102, depth2=144, depth3+=154..160]`. The fusion line therefore saved only shallow costs; the deep gathered rounds still dominate the remaining gap to `1149`.
+- 2026-03-11 07:48 UTC: two quick negative probes ruled out the simplest next shortcuts. The final branch bit of `myhash()` depends on all 32 input bits, so there is no cheap partial-hash parity path for early prefetch, and the mean unique-address count within an 8-lane block is only `[5.25, 6.46, 7.18, 7.58, 7.79, 7.89, 7.95, 7.97]` for depths `3..10`, so within-block repeated-address dedup has only about a `~100`-cycle ceiling.
+- 2026-03-11 07:48 UTC: the main new positive result is structural scheduling. Emitting the whole 16-round wave as one dependency DAG and scheduling slots by group, rather than by global stage, improved the independent branch from `2285` to `1815`. That improvement is real evidence that the old branch was still paying artificial round barriers deep in the program, not just shallow setup overhead.
 
 ## Candidate directions under evaluation
 
@@ -48,6 +50,7 @@
     - split after 4 or 5 bits: too fragmented to justify the reshuffle cost
   - 2026-03-11 06:13 UTC: corrected round-cost probes on the current kernel show why even the 2-bit/3-bit bucket splits are weak. With setup/store isolated by a `rounds=0` run, the current `256`-wide kernel costs about `70` cycles for depth `0`, `118` for the 2-way table round, `160` for the current 4-way table round, and `154..160` for generic gathered rounds. That means a 2-bit split only has one clearly cheaper replacement round (`118` versus `160`), while the current 4-way table is already basically as expensive as a gather round.
   - 2026-03-11 06:13 UTC: a one-shot proxy harness on smaller batch widths confirmed that per-bucket sequential execution is not viable. On the same height-10 tree, a `64`-wide kernel costs `91` cycles with `0` rounds, then `109/140/181/226/271/316` cycles for `1..6` rounds. Four such bucket-local passes are already slower than the current unified `256`-wide kernel before paying any bucket scatter / final restore cost.
+  - 2026-03-11 07:48 UTC: this family is no longer just a theory note. The earlier “scheduler polish does nothing” conclusion only applied to the old per-round kernel emission. Once the full 16-round sequence was emitted as one DAG, a simple group-first scheduler cut the independent branch from `2285` to `1815` by letting earlier blocks keep advancing while later blocks were still filling their loads. That is still not enough to reach `1149`, but it means cross-round overlap is a real lever when the compiler exposes it.
 - Block-local unique-address dedup on the earliest gathered rounds.
   - 2026-03-11 06:13 UTC: an additional Athena review suggested a representative-lane dedup only for the first gathered rounds (especially depth `3`), trading repeated per-lane loads for scalar ALU copies. The useful conclusion is the scale, not the exact mechanism: even the optimistic upside looks more like `~100` cycles than `~1000`, so this family may still be worth a small pilot but not as a likely direct path to beating `1149`.
   - 2026-03-11 07:24 UTC: a second Athena review, after the shallow-wave fusion landed, reinforced the same conclusion from a different angle. On the current path-state architecture, even perfect shallow cleanup only moves the fixed/setup side and the first two table rounds; any remaining original win large enough to matter has to attack the deep gathered rounds directly (for example overlap/prefetch on the gather line or early repeated-address dedup), not the shallow prefix again.
