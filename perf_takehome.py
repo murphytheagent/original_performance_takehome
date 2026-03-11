@@ -174,30 +174,6 @@ class KernelBuilder:
                 stage + 1,
             )
 
-        def add_blend(dest, mask, pick_one, pick_zero, deps, group, stage, temp=None):
-            temp = dest if temp is None else temp
-            mix_id = add_op(
-                "valu",
-                ("^", temp, pick_one, pick_zero),
-                deps,
-                group,
-                stage,
-            )
-            mask_id = add_op(
-                "valu",
-                ("&", temp, temp, mask),
-                [mix_id],
-                group,
-                stage + 1,
-            )
-            return add_op(
-                "valu",
-                ("^", dest, pick_zero, temp),
-                [mask_id],
-                group,
-                stage + 2,
-            )
-
         for local_group, block in enumerate(groups):
             val = self.value_blocks[block]
             path = self.path_blocks[block]
@@ -205,177 +181,31 @@ class KernelBuilder:
             node = self.wave_node[local_group]
             tmp1 = self.wave_tmp1[local_group]
             tmp2 = self.wave_tmp2[local_group]
-            tmp3 = self.wave_tmp3[local_group]
-            mask = self.wave_mask[local_group]
             node_deps = []
             if depth == 0:
-                node_src = self.shallow_nodes[0]
+                node_src = self.root_vec
             elif depth == 1:
-                mask_id = add_bit_mask(
-                    mask,
-                    path,
-                    self.one_vec,
-                    None,
-                    [],
-                    local_group,
-                    0,
-                )
                 node_deps.append(
-                    add_blend(
-                        node,
-                        mask,
-                        self.shallow_nodes[2],
-                        self.shallow_nodes[1],
-                        [mask_id],
+                    add_op(
+                        "load",
+                        ("vload", node, self.depth1_table_addrs[block]),
+                        [],
                         local_group,
-                        1,
+                        0,
                     )
                 )
                 node_src = node
             elif depth == 2:
-                bit1_id = add_bit_mask(
-                    mask,
-                    path,
-                    self.two_vec,
-                    self.one_vec,
-                    [],
-                    local_group,
-                    0,
-                )
-                left_id = add_blend(
-                    tmp1,
-                    mask,
-                    self.shallow_nodes[5],
-                    self.shallow_nodes[3],
-                    [bit1_id],
-                    local_group,
-                    1,
-                )
-                right_id = add_blend(
-                    tmp2,
-                    mask,
-                    self.shallow_nodes[6],
-                    self.shallow_nodes[4],
-                    [bit1_id],
-                    local_group,
-                    4,
-                )
-                bit0_id = add_bit_mask(
-                    addr,
-                    path,
-                    self.one_vec,
-                    None,
-                    [],
-                    local_group,
-                    1,
-                )
                 node_deps.append(
-                    add_blend(
-                        node,
-                        addr,
-                        tmp2,
-                        tmp1,
-                        [left_id, right_id, bit0_id],
+                    add_op(
+                        "load",
+                        ("vload", node, self.depth2_table_addrs[block]),
+                        [],
                         local_group,
-                        7,
+                        0,
                     )
                 )
                 node_src = node
-            elif depth == 3:
-                bit2_id = add_bit_mask(
-                    mask,
-                    path,
-                    self.four_vec,
-                    self.two_vec,
-                    [],
-                    local_group,
-                    0,
-                )
-                high_00 = add_blend(
-                    tmp1,
-                    mask,
-                    self.shallow_nodes[11],
-                    self.shallow_nodes[7],
-                    [bit2_id],
-                    local_group,
-                    1,
-                )
-                high_01 = add_blend(
-                    tmp2,
-                    mask,
-                    self.shallow_nodes[12],
-                    self.shallow_nodes[8],
-                    [bit2_id],
-                    local_group,
-                    4,
-                )
-                high_10 = add_blend(
-                    node,
-                    mask,
-                    self.shallow_nodes[13],
-                    self.shallow_nodes[9],
-                    [bit2_id],
-                    local_group,
-                    7,
-                )
-                high_11 = add_blend(
-                    addr,
-                    mask,
-                    self.shallow_nodes[14],
-                    self.shallow_nodes[10],
-                    [bit2_id],
-                    local_group,
-                    10,
-                )
-                bit1_mid = add_bit_mask(
-                    mask,
-                    path,
-                    self.two_vec,
-                    self.one_vec,
-                    [high_00, high_01, high_10, high_11],
-                    local_group,
-                    13,
-                )
-                mid_0 = add_blend(
-                    tmp1,
-                    mask,
-                    node,
-                    tmp1,
-                    [bit1_mid],
-                    local_group,
-                    16,
-                    temp=tmp3,
-                )
-                mid_1 = add_blend(
-                    node,
-                    mask,
-                    addr,
-                    tmp2,
-                    [bit1_mid],
-                    local_group,
-                    19,
-                )
-                bit0_low = add_bit_mask(
-                    mask,
-                    path,
-                    self.one_vec,
-                    None,
-                    [mid_0, mid_1],
-                    local_group,
-                    22,
-                )
-                node_deps.append(
-                    add_blend(
-                        addr,
-                        mask,
-                        node,
-                        tmp1,
-                        [bit0_low],
-                        local_group,
-                        25,
-                    )
-                )
-                node_src = addr
             else:
                 addr_id = add_op(
                     "valu",
@@ -503,7 +333,7 @@ class KernelBuilder:
                 12,
             )
             if depth == 0:
-                add_op(
+                next_path_id = add_op(
                     "valu",
                     ("+", path, addr, self.zero_vec),
                     [parity_id],
@@ -511,12 +341,121 @@ class KernelBuilder:
                     13,
                 )
             else:
-                add_op(
+                next_path_id = add_op(
                     "valu",
                     ("multiply_add", path, path, self.two_vec, addr),
                     [parity_id],
                     local_group,
                     13,
+                )
+
+            if depth == 0 and self.forest_height >= 1:
+                mask_id = add_bit_mask(
+                    addr,
+                    path,
+                    self.one_vec,
+                    None,
+                    [next_path_id],
+                    local_group,
+                    14,
+                )
+                diff_id = add_op(
+                    "valu",
+                    ("&", node, self.depth1_diff_vec, addr),
+                    [mask_id],
+                    local_group,
+                    16,
+                )
+                table_id = add_op(
+                    "valu",
+                    ("^", node, self.depth1_base_vec, node),
+                    [diff_id],
+                    local_group,
+                    17,
+                )
+                add_op(
+                    "store",
+                    ("vstore", self.depth1_table_addrs[block], node),
+                    [table_id],
+                    local_group,
+                    18,
+                )
+            elif depth == 1 and self.forest_height >= 2:
+                hi_mask_id = add_bit_mask(
+                    addr,
+                    path,
+                    self.two_vec,
+                    self.one_vec,
+                    [next_path_id],
+                    local_group,
+                    14,
+                )
+                lo_mask_id = add_bit_mask(
+                    node,
+                    path,
+                    self.one_vec,
+                    None,
+                    [next_path_id],
+                    local_group,
+                    14,
+                )
+                left_diff_id = add_op(
+                    "valu",
+                    ("&", tmp1, self.depth2_left_diff_vec, addr),
+                    [hi_mask_id],
+                    local_group,
+                    17,
+                )
+                right_diff_id = add_op(
+                    "valu",
+                    ("&", tmp2, self.depth2_right_diff_vec, addr),
+                    [hi_mask_id],
+                    local_group,
+                    17,
+                    1,
+                )
+                left_id = add_op(
+                    "valu",
+                    ("^", tmp1, self.depth2_left_base_vec, tmp1),
+                    [left_diff_id],
+                    local_group,
+                    18,
+                )
+                right_id = add_op(
+                    "valu",
+                    ("^", tmp2, self.depth2_right_base_vec, tmp2),
+                    [right_diff_id],
+                    local_group,
+                    18,
+                    1,
+                )
+                mix_id = add_op(
+                    "valu",
+                    ("^", addr, tmp1, tmp2),
+                    [left_id, right_id],
+                    local_group,
+                    19,
+                )
+                select_id = add_op(
+                    "valu",
+                    ("&", addr, addr, node),
+                    [mix_id, lo_mask_id],
+                    local_group,
+                    20,
+                )
+                table_id = add_op(
+                    "valu",
+                    ("^", node, tmp1, addr),
+                    [select_id],
+                    local_group,
+                    21,
+                )
+                add_op(
+                    "store",
+                    ("vstore", self.depth2_table_addrs[block], node),
+                    [table_id],
+                    local_group,
+                    22,
                 )
 
         self._schedule_ops(ops)
@@ -529,12 +468,11 @@ class KernelBuilder:
         inp_indices_p = forest_values_p + n_nodes
         inp_values_p = inp_indices_p + batch_size
         n_blocks = batch_size // VLEN
-        wave_size = min(13, n_blocks)
+        wave_size = min(16, n_blocks)
 
         self.zero_vec = self.scratch_vconst(0, "zero_vec")
         self.one_vec = self.scratch_vconst(1, "one_vec")
         self.two_vec = self.scratch_vconst(2, "two_vec")
-        self.four_vec = self.scratch_vconst(4, "four_vec")
         self.mul_4097_vec = self.scratch_vconst(4097, "mul_4097_vec")
         self.mul_33_vec = self.scratch_vconst(33, "mul_33_vec")
         self.mul_9_vec = self.scratch_vconst(9, "mul_9_vec")
@@ -572,27 +510,42 @@ class KernelBuilder:
         self.wave_tmp2 = [
             self.alloc_scratch(f"wave_tmp2_{i}", VLEN) for i in range(wave_size)
         ]
-        self.wave_tmp3 = [
-            self.alloc_scratch(f"wave_tmp3_{i}", VLEN) for i in range(wave_size)
-        ]
-        self.wave_mask = [
-            self.alloc_scratch(f"wave_mask_{i}", VLEN) for i in range(wave_size)
-        ]
         preload_scalar = self.alloc_scratch("preload_scalar")
-        self.shallow_nodes = {}
-        for node_idx in range(15):
+        shallow_nodes = {}
+        for node_idx in range(7):
             node_addr = self.scratch_const(
                 forest_values_p + node_idx, f"shallow_node_addr_{node_idx}"
             )
             node_vec = self.alloc_scratch(f"shallow_node_{node_idx}", VLEN)
             self.emit(load=[("load", preload_scalar, node_addr)])
             self.emit(valu=[("vbroadcast", node_vec, preload_scalar)])
-            self.shallow_nodes[node_idx] = node_vec
+            shallow_nodes[node_idx] = node_vec
+
+        self.root_vec = shallow_nodes[0]
+        self.depth1_base_vec = shallow_nodes[1]
+        self.depth2_left_base_vec = shallow_nodes[3]
+        self.depth2_right_base_vec = shallow_nodes[4]
+        self.depth1_diff_vec = self.alloc_scratch("depth1_diff_vec", VLEN)
+        self.depth2_left_diff_vec = self.alloc_scratch("depth2_left_diff_vec", VLEN)
+        self.depth2_right_diff_vec = self.alloc_scratch("depth2_right_diff_vec", VLEN)
+        self.emit(
+            valu=[
+                ("^", self.depth1_diff_vec, shallow_nodes[1], shallow_nodes[2]),
+                ("^", self.depth2_left_diff_vec, shallow_nodes[3], shallow_nodes[5]),
+                ("^", self.depth2_right_diff_vec, shallow_nodes[4], shallow_nodes[6]),
+            ]
+        )
+
+        self.depth1_table_addrs = [
+            self.scratch_const(inp_indices_p + block * VLEN, f"depth1_table_addr_{block}")
+            for block in range(n_blocks)
+        ]
 
         value_addr_consts = [
             self.scratch_const(inp_values_p + block * VLEN, f"value_addr_{block}")
             for block in range(n_blocks)
         ]
+        self.depth2_table_addrs = value_addr_consts
 
         for block in range(0, n_blocks, 2):
             load_slots = [("vload", self.value_blocks[block], value_addr_consts[block])]
