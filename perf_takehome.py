@@ -108,13 +108,7 @@ class KernelBuilder:
                 ]
                 def sort_key(op):
                     if engine == "valu":
-                        return (
-                            0 if op["stage"] < 7 else 1,
-                            -op["group"],
-                            op["stage"],
-                            op["priority"],
-                            op["id"],
-                        )
+                        return (-op["group"], op["stage"], op["priority"], op["id"])
                     return (
                         op["group"],
                         op["stage"],
@@ -331,19 +325,13 @@ class KernelBuilder:
 
             parity_id = add_op(
                 "valu",
-                ("&", addr, val, self.one_vec),
+                ("&", path if depth == 0 else addr, val, self.one_vec),
                 [hash_done],
                 local_group,
                 12,
             )
             if depth == 0:
-                next_path_id = add_op(
-                    "valu",
-                    ("+", path, addr, self.zero_vec),
-                    [parity_id],
-                    local_group,
-                    13,
-                )
+                next_path_id = parity_id
             else:
                 next_path_id = add_op(
                     "valu",
@@ -485,31 +473,24 @@ class KernelBuilder:
                 )
                 pair67_id = add_op(
                     "flow",
-                    ("vselect", tmp2, tmp1, self.depth3_nodes[7], self.depth3_nodes[6]),
+                    ("vselect", tmp1, tmp1, self.depth3_nodes[7], self.depth3_nodes[6]),
                     [upper_half0_id],
                     local_group,
                     19,
                 )
-                mid23_id = add_op(
-                    "valu",
-                    ("&", tmp1, path, self.two_vec),
+                upper_half1_id = add_op(
+                    "flow",
+                    ("vselect", addr, tmp2, tmp1, addr),
                     [pair45_id, pair67_id],
                     local_group,
                     20,
-                )
-                upper_half1_id = add_op(
-                    "flow",
-                    ("vselect", addr, tmp1, tmp2, addr),
-                    [mid23_id, pair45_id, pair67_id],
-                    local_group,
-                    21,
                 )
                 table_id = add_op(
                     "flow",
                     ("vselect", node, tmp3, addr, node),
                     [hi_id, upper_half0_id, upper_half1_id],
                     local_group,
-                    22,
+                    21,
                 )
                 if cache_next_nodes:
                     carry_deps.append(table_id)
