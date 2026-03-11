@@ -128,7 +128,15 @@ class KernelBuilder:
             done.update(completed_this_cycle)
             self.instrs.append(instr)
 
-    def _build_vector_wave(self, groups, depth, is_final):
+    def _build_vector_wave(
+        self,
+        groups,
+        depth,
+        is_final,
+        *,
+        use_cached_nodes=False,
+        cache_next_nodes=False,
+    ):
         ops = []
         next_id = 0
 
@@ -184,27 +192,8 @@ class KernelBuilder:
             node_deps = []
             if depth == 0:
                 node_src = self.root_vec
-            elif depth == 1:
-                node_deps.append(
-                    add_op(
-                        "load",
-                        ("vload", node, self.depth1_table_addrs[block]),
-                        [],
-                        local_group,
-                        0,
-                    )
-                )
-                node_src = node
-            elif depth == 2:
-                node_deps.append(
-                    add_op(
-                        "load",
-                        ("vload", node, self.depth2_table_addrs[block]),
-                        [],
-                        local_group,
-                        0,
-                    )
-                )
+            elif depth in (1, 2):
+                assert use_cached_nodes, "shallow rounds should use cached node vectors"
                 node_src = node
             else:
                 addr_id = add_op(
@@ -373,13 +362,14 @@ class KernelBuilder:
                     local_group,
                     17,
                 )
-                add_op(
-                    "store",
-                    ("vstore", self.depth1_table_addrs[block], node),
-                    [table_id],
-                    local_group,
-                    18,
-                )
+                if not cache_next_nodes:
+                    add_op(
+                        "store",
+                        ("vstore", self.depth1_table_addrs[block], node),
+                        [table_id],
+                        local_group,
+                        18,
+                    )
             elif depth == 1 and self.forest_height >= 2:
                 hi_mask_id = add_bit_mask(
                     addr,
@@ -450,15 +440,43 @@ class KernelBuilder:
                     local_group,
                     21,
                 )
-                add_op(
-                    "store",
-                    ("vstore", self.depth2_table_addrs[block], node),
-                    [table_id],
-                    local_group,
-                    22,
-                )
+                if not cache_next_nodes:
+                    add_op(
+                        "store",
+                        ("vstore", self.depth2_table_addrs[block], node),
+                        [table_id],
+                        local_group,
+                        22,
+                    )
 
         self._schedule_ops(ops)
+
+    def _build_fused_shallow_wave(self, groups, fused_rounds, remaining_rounds):
+        self._build_vector_wave(
+            groups,
+            0,
+            remaining_rounds == 1,
+            cache_next_nodes=fused_rounds > 1,
+        )
+        if fused_rounds < 2:
+            return
+
+        self._build_vector_wave(
+            groups,
+            1,
+            remaining_rounds == 2,
+            use_cached_nodes=True,
+            cache_next_nodes=fused_rounds > 2,
+        )
+        if fused_rounds < 3:
+            return
+
+        self._build_vector_wave(
+            groups,
+            2,
+            remaining_rounds == 3,
+            use_cached_nodes=True,
+        )
 
     def _build_vector_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -485,6 +503,7 @@ class KernelBuilder:
         self.shift_19_vec = self.scratch_vconst(HASH_STAGES[1][4], "shift_19_vec")
         self.shift_9_vec = self.scratch_vconst(HASH_STAGES[3][4], "shift_9_vec")
         self.shift_16_vec = self.scratch_vconst(HASH_STAGES[5][4], "shift_16_vec")
+        self.pair_stride = self.scratch_const(VLEN * 2, "pair_stride")
 
         self.base_vecs = {}
         for depth in range(1, forest_height + 1):
@@ -536,45 +555,64 @@ class KernelBuilder:
             ]
         )
 
-        self.depth1_table_addrs = [
-            self.scratch_const(inp_indices_p + block * VLEN, f"depth1_table_addr_{block}")
-            for block in range(n_blocks)
-        ]
-
-        value_addr_consts = [
-            self.scratch_const(inp_values_p + block * VLEN, f"value_addr_{block}")
-            for block in range(n_blocks)
-        ]
-        self.depth2_table_addrs = value_addr_consts
+        value_addr0 = self.alloc_scratch("value_addr0")
+        value_addr1 = self.alloc_scratch("value_addr1")
+        self.emit(
+            load=[
+                ("const", value_addr0, inp_values_p),
+                ("const", value_addr1, inp_values_p + VLEN),
+            ]
+        )
 
         for block in range(0, n_blocks, 2):
-            load_slots = [("vload", self.value_blocks[block], value_addr_consts[block])]
+            load_slots = [("vload", self.value_blocks[block], value_addr0)]
             if block + 1 < n_blocks:
-                load_slots.append(
-                    ("vload", self.value_blocks[block + 1], value_addr_consts[block + 1])
-                )
-            self.emit(load=load_slots)
+                load_slots.append(("vload", self.value_blocks[block + 1], value_addr1))
+            alu_slots = []
+            if block + 2 < n_blocks:
+                alu_slots.append(("+", value_addr0, value_addr0, self.pair_stride))
+                alu_slots.append(("+", value_addr1, value_addr1, self.pair_stride))
+            self.emit(load=load_slots, alu=alu_slots)
 
-        for round_idx in range(rounds):
+        round_idx = 0
+        while round_idx < rounds:
             depth = round_idx % (forest_height + 1)
+            if depth == 0:
+                remaining_rounds = rounds - round_idx
+                fused_rounds = min(remaining_rounds, forest_height + 1, 3)
+                for block in range(0, n_blocks, wave_size):
+                    groups = list(range(block, min(block + wave_size, n_blocks)))
+                    self._build_fused_shallow_wave(groups, fused_rounds, remaining_rounds)
+                round_idx += fused_rounds
+                continue
+
             is_final = round_idx == rounds - 1
             for block in range(0, n_blocks, wave_size):
                 groups = list(range(block, min(block + wave_size, n_blocks)))
                 self._build_vector_wave(groups, depth, is_final)
+            round_idx += 1
 
-        for block in range(0, n_blocks, 2):
-            store_slots = [
-                ("vstore", value_addr_consts[block], self.value_blocks[block])
+        self.emit(
+            load=[
+                ("const", value_addr0, inp_values_p),
+                ("const", value_addr1, inp_values_p + VLEN),
             ]
+        )
+        for block in range(0, n_blocks, 2):
+            store_slots = [("vstore", value_addr0, self.value_blocks[block])]
             if block + 1 < n_blocks:
                 store_slots.append(
                     (
                         "vstore",
-                        value_addr_consts[block + 1],
+                        value_addr1,
                         self.value_blocks[block + 1],
                     )
                 )
-            self.emit(store=store_slots)
+            alu_slots = []
+            if block + 2 < n_blocks:
+                alu_slots.append(("+", value_addr0, value_addr0, self.pair_stride))
+                alu_slots.append(("+", value_addr1, value_addr1, self.pair_stride))
+            self.emit(store=store_slots, alu=alu_slots)
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
@@ -678,7 +716,7 @@ class KernelBuilder:
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
-        if N_CORES == 1 and batch_size % VLEN == 0:
+        if N_CORES == 1 and batch_size % VLEN == 0 and batch_size <= 256:
             self._build_vector_kernel(forest_height, n_nodes, batch_size, rounds)
         else:
             self._build_scalar_kernel(forest_height, n_nodes, batch_size, rounds)

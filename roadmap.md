@@ -4,8 +4,8 @@
 
 - 2026-03-11 03:07 UTC: Fork PR branch `perf-kernel-optimization` is still parked at a guarded `1189` cycles on `python tests/submission_tests.py`, down from the starter `147734`.
 - 2026-03-11 03:23 UTC: That `1189` branch is no longer considered a valid final answer because it is materially derived from upstream PR `#35` and no longer beats the live upstream best of `1149`.
-- Current milestone: replace the disqualified PR35-derived branch with an original kernel that beats `1149`; the most obvious regrouping candidates have now been measured and the search needs a different load-reduction idea than shallow caches or simple prefix bucket splits.
-- 2026-03-11 05:32 UTC: A new original shallow-cache prototype is now checkpointed at `2411` cycles. It is correct, but it only trims `14` cycles from the clean `2425` branch and does not change the strategic direction: shallow-only caching is not enough.
+- 2026-03-11 07:24 UTC: The current best independent rewrite branch is now `2285` cycles on the unmodified submission harness. That came from two independent cleanups on top of the `2411` shallow-cache branch: fuse the depth-0/1/2 wave so the shallow node vectors stay in scratch instead of spilling to memory, then remove the dead per-block value-address constant table from setup.
+- Current milestone: replace the disqualified PR35-derived branch with an original kernel that beats `1149`; the new round-cost breakdown says the shallow prefix is no longer the main waste, so the next attempt has to target the deeper gathered rounds rather than more shallow cache/table cleanup.
 
 ## Milestone 1 — Baseline And Constraints
 
@@ -29,9 +29,9 @@ Success criteria:
 Gate status:
 - `done` — selected and documented a vectorized scratch-resident path-state design.
 - `done` — implemented the first redesign and validated correctness.
-- `done` — current redesign improves the benchmark materially to `2425` cycles.
+- `done` — current redesign improves the benchmark materially to `2285` cycles.
 - `in_progress` — next redesign step still needed for the remaining node-access bottleneck.
-- `in_progress` — wave-size and scheduler sweeps were flat, so the remaining work is still structural rather than scheduling polish.
+- `in_progress` — wave-size and scheduler sweeps were flat, and the 2026-03-11 07:24 UTC shallow-wave fusion confirms that only the shallow prefix still had easy waste. The remaining work is now even more clearly structural rather than scheduling polish.
 
 ## Milestone 3 — Competitive Result
 
@@ -43,5 +43,5 @@ Success criteria:
 Gate status:
 - `in_progress` — current fork PR branch beats `1487` but fails the originality / best-upstream bar.
 - `in_progress` — independent rewrite branch started from original commit `ca5bfd5`.
-- `in_progress` — latest independent checkpoint `18a4d28` proves a shallow reclaimed-workspace cache is correct but too small a win, so the next attempt still needs a coarser regrouping idea.
+- `in_progress` — latest independent checkpoint after the shallow-wave fusion / setup compaction is `2285` cycles, still correct on the submission harness and extra spot checks, but still far from the `1149` target.
 - `in_progress` — corrected 2026-03-11 06:13 UTC cycle accounting rules out the naïve 2-bit / 3-bit prefix-bucket path as a likely winner; even before permutation cost, the current 4-way table round is already near generic-round cost.
