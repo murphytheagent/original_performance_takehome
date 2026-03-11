@@ -90,6 +90,91 @@ class KernelBuilder:
             self.vector_const_map[val] = addr
         return self.vector_const_map[val]
 
+    def _emit_packed_const_broadcasts(self, specs, scalar_tmps, final_loads=None):
+        if not specs:
+            return
+
+        width = len(scalar_tmps)
+        pending = []
+        idx = 0
+        while idx < len(specs):
+            chunk = specs[idx : idx + width]
+            self.emit(
+                load=[
+                    ("const", scalar_tmps[temp_i], value)
+                    for temp_i, (value, _dest) in enumerate(chunk)
+                ],
+                valu=[
+                    ("vbroadcast", dest, scalar_tmps[temp_i])
+                    for temp_i, (_value, dest) in enumerate(pending)
+                ],
+            )
+            pending = chunk
+            idx += len(chunk)
+
+        self.emit(
+            load=[] if final_loads is None else final_loads,
+            valu=[
+                ("vbroadcast", dest, scalar_tmps[temp_i])
+                for temp_i, (_value, dest) in enumerate(pending)
+            ],
+        )
+
+    def _emit_packed_contiguous_node_preloads(
+        self,
+        dests,
+        *,
+        start_addr,
+        addr_tmps,
+        value_tmps,
+        stride_const,
+        final_loads=None,
+    ):
+        if not dests:
+            return
+
+        width = min(len(addr_tmps), len(value_tmps))
+        assert width >= 2, "preload pipeline expects at least two lanes of staging"
+
+        self.emit(
+            load=[
+                ("const", addr_tmps[0], start_addr),
+                ("const", addr_tmps[1], start_addr + 1),
+            ]
+        )
+
+        pending = []
+        next_idx = 0
+        while next_idx < len(dests):
+            chunk = dests[next_idx : next_idx + width]
+            alu_slots = []
+            if len(chunk) == width and next_idx + len(chunk) < len(dests):
+                alu_slots = [
+                    ("+", addr_tmps[temp_i], addr_tmps[temp_i], stride_const)
+                    for temp_i in range(width)
+                ]
+            self.emit(
+                load=[
+                    ("load", value_tmps[temp_i], addr_tmps[temp_i])
+                    for temp_i in range(len(chunk))
+                ],
+                valu=[
+                    ("vbroadcast", dest, value_tmps[temp_i])
+                    for temp_i, dest in enumerate(pending)
+                ],
+                alu=alu_slots,
+            )
+            pending = chunk
+            next_idx += len(chunk)
+
+        self.emit(
+            load=[] if final_loads is None else final_loads,
+            valu=[
+                ("vbroadcast", dest, value_tmps[temp_i])
+                for temp_i, dest in enumerate(pending)
+            ],
+        )
+
     def _schedule_ops(self, ops):
         by_id = {op["id"]: op for op in ops}
         remaining = set(by_id)
@@ -547,27 +632,33 @@ class KernelBuilder:
         n_blocks = batch_size // VLEN
         wave_size = min(16, n_blocks)
 
-        self.zero_vec = self.scratch_vconst(0, "zero_vec")
-        self.one_vec = self.scratch_vconst(1, "one_vec")
-        self.two_vec = self.scratch_vconst(2, "two_vec")
-        self.four_vec = self.scratch_vconst(4, "four_vec")
-        self.mul_4097_vec = self.scratch_vconst(4097, "mul_4097_vec")
-        self.mul_33_vec = self.scratch_vconst(33, "mul_33_vec")
-        self.mul_9_vec = self.scratch_vconst(9, "mul_9_vec")
-        self.hash_add0_vec = self.scratch_vconst(HASH_STAGES[0][1], "hash_add0_vec")
-        self.hash_xor1_vec = self.scratch_vconst(HASH_STAGES[1][1], "hash_xor1_vec")
-        self.hash_add2_vec = self.scratch_vconst(HASH_STAGES[2][1], "hash_add2_vec")
-        self.hash_add3_vec = self.scratch_vconst(HASH_STAGES[3][1], "hash_add3_vec")
-        self.hash_add4_vec = self.scratch_vconst(HASH_STAGES[4][1], "hash_add4_vec")
-        self.hash_xor5_vec = self.scratch_vconst(HASH_STAGES[5][1], "hash_xor5_vec")
-        self.shift_19_vec = self.scratch_vconst(HASH_STAGES[1][4], "shift_19_vec")
-        self.shift_9_vec = self.scratch_vconst(HASH_STAGES[3][4], "shift_9_vec")
-        self.shift_16_vec = self.scratch_vconst(HASH_STAGES[5][4], "shift_16_vec")
-        self.pair_stride = self.scratch_const(VLEN * 2, "pair_stride")
+        packed_vconsts = []
+
+        def alloc_packed_vconst(value, name):
+            addr = self.alloc_scratch(name, VLEN)
+            packed_vconsts.append((value, addr))
+            return addr
+
+        self.zero_vec = alloc_packed_vconst(0, "zero_vec")
+        self.one_vec = alloc_packed_vconst(1, "one_vec")
+        self.two_vec = alloc_packed_vconst(2, "two_vec")
+        self.four_vec = alloc_packed_vconst(4, "four_vec")
+        self.mul_4097_vec = alloc_packed_vconst(4097, "mul_4097_vec")
+        self.mul_33_vec = alloc_packed_vconst(33, "mul_33_vec")
+        self.mul_9_vec = alloc_packed_vconst(9, "mul_9_vec")
+        self.hash_add0_vec = alloc_packed_vconst(HASH_STAGES[0][1], "hash_add0_vec")
+        self.hash_xor1_vec = alloc_packed_vconst(HASH_STAGES[1][1], "hash_xor1_vec")
+        self.hash_add2_vec = alloc_packed_vconst(HASH_STAGES[2][1], "hash_add2_vec")
+        self.hash_add3_vec = alloc_packed_vconst(HASH_STAGES[3][1], "hash_add3_vec")
+        self.hash_add4_vec = alloc_packed_vconst(HASH_STAGES[4][1], "hash_add4_vec")
+        self.hash_xor5_vec = alloc_packed_vconst(HASH_STAGES[5][1], "hash_xor5_vec")
+        self.shift_19_vec = alloc_packed_vconst(HASH_STAGES[1][4], "shift_19_vec")
+        self.shift_9_vec = alloc_packed_vconst(HASH_STAGES[3][4], "shift_9_vec")
+        self.shift_16_vec = alloc_packed_vconst(HASH_STAGES[5][4], "shift_16_vec")
 
         self.base_vecs = {}
         for depth in range(4, forest_height + 1):
-            self.base_vecs[depth] = self.scratch_vconst(
+            self.base_vecs[depth] = alloc_packed_vconst(
                 forest_values_p + (1 << depth) - 1, f"base_vec_{depth}"
             )
 
@@ -592,16 +683,37 @@ class KernelBuilder:
         self.wave_tmp3 = [
             self.alloc_scratch(f"wave_tmp3_{i}", VLEN) for i in range(wave_size)
         ]
-        preload_scalar = self.alloc_scratch("preload_scalar")
-        shallow_nodes = {}
-        for node_idx in range(15):
-            node_addr = self.scratch_const(
-                forest_values_p + node_idx, f"shallow_node_addr_{node_idx}"
-            )
-            node_vec = self.alloc_scratch(f"shallow_node_{node_idx}", VLEN)
-            self.emit(load=[("load", preload_scalar, node_addr)])
-            self.emit(valu=[("vbroadcast", node_vec, preload_scalar)])
-            shallow_nodes[node_idx] = node_vec
+        self.pair_stride = self.alloc_scratch("pair_stride")
+        shallow_stride = self.alloc_scratch("shallow_stride")
+        value_addr0 = self.alloc_scratch("value_addr0")
+        value_addr1 = self.alloc_scratch("value_addr1")
+        init_scalar0 = self.alloc_scratch("init_scalar0")
+        init_scalar1 = self.alloc_scratch("init_scalar1")
+
+        shallow_nodes = {
+            node_idx: self.alloc_scratch(f"shallow_node_{node_idx}", VLEN)
+            for node_idx in range(15)
+        }
+
+        self._emit_packed_const_broadcasts(
+            packed_vconsts,
+            [init_scalar0, init_scalar1],
+            final_loads=[
+                ("const", self.pair_stride, VLEN * 2),
+                ("const", shallow_stride, 2),
+            ],
+        )
+        self._emit_packed_contiguous_node_preloads(
+            [shallow_nodes[node_idx] for node_idx in range(15)],
+            start_addr=forest_values_p,
+            addr_tmps=[value_addr0, value_addr1],
+            value_tmps=[init_scalar0, init_scalar1],
+            stride_const=shallow_stride,
+            final_loads=[
+                ("const", value_addr0, inp_values_p),
+                ("const", value_addr1, inp_values_p + VLEN),
+            ],
+        )
 
         self.root_vec = shallow_nodes[0]
         self.depth1_base_vec = shallow_nodes[1]
@@ -611,15 +723,6 @@ class KernelBuilder:
         self.depth2_right_base_vec = shallow_nodes[5]
         self.depth2_right_alt_vec = shallow_nodes[6]
         self.depth3_nodes = [shallow_nodes[node_idx] for node_idx in range(7, 15)]
-
-        value_addr0 = self.alloc_scratch("value_addr0")
-        value_addr1 = self.alloc_scratch("value_addr1")
-        self.emit(
-            load=[
-                ("const", value_addr0, inp_values_p),
-                ("const", value_addr1, inp_values_p + VLEN),
-            ]
-        )
 
         for block in range(0, n_blocks, 2):
             load_slots = [("vload", self.value_blocks[block], value_addr0)]
