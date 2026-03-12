@@ -197,7 +197,14 @@ class KernelBuilder:
                         return (
                             0 if late_stage else 1,
                             op["stage"],
-                            op["group"] if late_stage else -op["group"],
+                            -op["group"] if late_stage else op["group"],
+                            op["priority"],
+                            op["id"],
+                        )
+                    if engine in ("load", "flow"):
+                        return (
+                            -op["group"],
+                            op["stage"],
                             op["priority"],
                             op["id"],
                         )
