@@ -261,31 +261,6 @@ class KernelBuilder:
             )
             return op_id
 
-        def add_bit_mask(dest, src, bit_const, shift_const, deps, group, stage):
-            bit_id = add_op(
-                "valu",
-                ("&", dest, src, bit_const),
-                deps,
-                group,
-                stage,
-            )
-            if shift_const is not None:
-                bit_id = add_op(
-                    "valu",
-                    (">>", dest, dest, shift_const),
-                    [bit_id],
-                    group,
-                    stage + 1,
-                )
-                stage += 1
-            return add_op(
-                "valu",
-                ("-", dest, self.zero_vec, dest),
-                [bit_id],
-                group,
-                stage + 1,
-            )
-
         next_state_deps = []
         for local_group, block in enumerate(groups):
             round_start = list(state_deps[local_group])
@@ -685,7 +660,7 @@ class KernelBuilder:
                 )
                 addr_deps = [inc0, inc1]
 
-        return next_id
+        return next_id, addr_deps
 
     def _build_vector_round_sequence_with_io(
         self,
@@ -780,7 +755,7 @@ class KernelBuilder:
 
         io_group_base = len(groups) + 1000
         if prefetch_pairs:
-            next_id = self._append_stream_io_ops(
+            next_id, _ = self._append_stream_io_ops(
                 ops,
                 next_id,
                 pairs=prefetch_pairs,
@@ -790,8 +765,9 @@ class KernelBuilder:
                 stage_base=1000,
             )
             io_group_base += len(prefetch_pairs) + 1
+        store_addr_deps = None
         if store_pairs:
-            next_id = self._append_stream_io_ops(
+            next_id, store_addr_deps = self._append_stream_io_ops(
                 ops,
                 next_id,
                 pairs=store_pairs,
@@ -807,7 +783,41 @@ class KernelBuilder:
                 state_deps[local_index[block0]] + state_deps[local_index[block1]]
                 for block0, block1 in final_store_pairs
             ]
-            next_id = self._append_stream_io_ops(
+            if final_store_addr_regs == store_addr_regs and store_addr_deps:
+                def add_op(engine, slot, deps, group, stage, priority=0):
+                    nonlocal next_id
+                    op_id = next_id
+                    next_id += 1
+                    ops.append(
+                        {
+                            "id": op_id,
+                            "engine": engine,
+                            "slot": slot,
+                            "deps": list(deps),
+                            "group": group,
+                            "stage": stage,
+                            "priority": priority,
+                        }
+                    )
+                    return op_id
+
+                bump0 = add_op(
+                    "alu",
+                    ("+", final_store_addr_regs[0], final_store_addr_regs[0], self.pair_stride),
+                    store_addr_deps,
+                    io_group_base,
+                    1198,
+                )
+                bump1 = add_op(
+                    "alu",
+                    ("+", final_store_addr_regs[1], final_store_addr_regs[1], self.pair_stride),
+                    store_addr_deps,
+                    io_group_base,
+                    1198,
+                    1,
+                )
+                final_store_pair_deps[0].extend([bump0, bump1])
+            next_id, _ = self._append_stream_io_ops(
                 ops,
                 next_id,
                 pairs=final_store_pairs,
@@ -859,7 +869,6 @@ class KernelBuilder:
             packed_vconsts.append((value, addr))
             return addr
 
-        self.zero_vec = alloc_packed_vconst(0, "zero_vec")
         self.one_vec = alloc_packed_vconst(1, "one_vec")
         self.two_vec = alloc_packed_vconst(2, "two_vec")
         self.four_vec = alloc_packed_vconst(4, "four_vec")
@@ -909,8 +918,6 @@ class KernelBuilder:
         value_addr1 = self.alloc_scratch("value_addr1")
         init_scalar0 = self.alloc_scratch("init_scalar0")
         init_scalar1 = self.alloc_scratch("init_scalar1")
-        final_store_addr0 = self.alloc_scratch("final_store_addr0")
-        final_store_addr1 = self.alloc_scratch("final_store_addr1")
         startup_addr0 = self.alloc_scratch("startup_addr0")
         startup_addr1 = self.alloc_scratch("startup_addr1")
 
@@ -927,16 +934,19 @@ class KernelBuilder:
                 ("const", shallow_stride, 2),
             ],
         )
+        startup_delay_pairs = 4 if rounds != 0 and n_blocks == 2 * wave_size and wave_size == 16 else 0
+        startup_start_block = startup_delay_pairs * 2
+        preload_final_loads = [
+            ("const", startup_addr0 if startup_start_block else value_addr0, inp_values_p),
+            ("const", startup_addr1 if startup_start_block else value_addr1, inp_values_p + VLEN),
+        ]
         self._emit_packed_contiguous_node_preloads(
             [shallow_nodes[node_idx] for node_idx in range(15)],
             start_addr=forest_values_p,
             addr_tmps=[value_addr0, value_addr1],
             value_tmps=[init_scalar0, init_scalar1],
             stride_const=shallow_stride,
-            final_loads=[
-                ("const", value_addr0, inp_values_p),
-                ("const", value_addr1, inp_values_p + VLEN),
-            ],
+            final_loads=preload_final_loads,
         )
 
         self.root_vec = shallow_nodes[0]
@@ -952,8 +962,6 @@ class KernelBuilder:
         # On the frozen two-wave submission shape, delay the lowest pairs so they
         # load into otherwise idle early-body load slots instead of paying all 8
         # first-wave pairs as fixed startup cost.
-        startup_delay_pairs = 4 if rounds != 0 and n_blocks == 2 * wave_size and wave_size == 16 else 0
-        startup_start_block = startup_delay_pairs * 2
         if startup_start_block:
             self.emit(
                 load=[
@@ -966,7 +974,9 @@ class KernelBuilder:
             if block + 1 < n_blocks:
                 load_slots.append(("vload", self.value_blocks[block + 1], value_addr1))
             alu_slots = []
-            if block + 2 < first_wave_blocks:
+            if block + 2 < first_wave_blocks or (
+                startup_start_block and block + 2 == first_wave_blocks and rounds != 0 and n_blocks == 2 * wave_size
+            ):
                 alu_slots.append(("+", value_addr0, value_addr0, self.pair_stride))
                 alu_slots.append(("+", value_addr1, value_addr1, self.pair_stride))
             self.emit(load=load_slots, alu=alu_slots)
@@ -996,12 +1006,6 @@ class KernelBuilder:
                         (pair_i, pair_i + 1)
                         for pair_i in range(0, startup_delay_pairs * 2, 2)
                     ]
-                    self.emit(
-                        load=[
-                            ("const", startup_addr0, inp_values_p),
-                            ("const", startup_addr1, inp_values_p + VLEN),
-                        ]
-                    )
                     initial_load_addr_regs = (startup_addr0, startup_addr1)
 
                 prefetch_pairs = None
@@ -1014,12 +1018,13 @@ class KernelBuilder:
                             (next_groups[pair_i], next_groups[pair_i + 1])
                             for pair_i in range(0, len(next_groups), 2)
                         ]
-                        self.emit(
-                            load=[
-                                ("const", value_addr0, inp_values_p + next_groups[0] * VLEN),
-                                ("const", value_addr1, inp_values_p + (next_groups[0] + 1) * VLEN),
-                            ]
-                        )
+                        if block != 0 or not startup_delay_pairs:
+                            self.emit(
+                                load=[
+                                    ("const", value_addr0, inp_values_p + next_groups[0] * VLEN),
+                                    ("const", value_addr1, inp_values_p + (next_groups[0] + 1) * VLEN),
+                                ]
+                            )
 
                 store_pairs = None
                 if block >= wave_size:
@@ -1043,13 +1048,7 @@ class KernelBuilder:
                         (final_groups[pair_i], final_groups[pair_i + 1])
                         for pair_i in range(0, len(final_groups), 2)
                     ]
-                    self.emit(
-                        load=[
-                            ("const", final_store_addr0, inp_values_p + final_groups[0] * VLEN),
-                            ("const", final_store_addr1, inp_values_p + (final_groups[0] + 1) * VLEN),
-                        ]
-                    )
-                    final_store_addr_regs = (final_store_addr0, final_store_addr1)
+                    final_store_addr_regs = (init_scalar0, init_scalar1)
 
                 self._build_vector_round_sequence_with_io(
                     groups,
