@@ -193,7 +193,14 @@ class KernelBuilder:
                 ]
                 def sort_key(op):
                     if engine == "valu":
-                        return (-op["group"], op["stage"], op["priority"], op["id"])
+                        late_stage = op["stage"] >= 8
+                        return (
+                            0 if late_stage else 1,
+                            op["stage"],
+                            op["group"] if late_stage else -op["group"],
+                            op["priority"],
+                            op["id"],
+                        )
                     return (
                         op["group"],
                         op["stage"],
