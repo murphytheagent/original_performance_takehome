@@ -692,6 +692,8 @@ class KernelBuilder:
         groups,
         round_specs,
         *,
+        initial_load_pairs=None,
+        initial_load_addr_regs=None,
         prefetch_pairs=None,
         prefetch_addr_regs=None,
         store_pairs=None,
@@ -702,6 +704,68 @@ class KernelBuilder:
         ops = []
         next_id = 0
         state_deps = [[] for _ in groups]
+        if initial_load_pairs:
+            local_index = {group: idx for idx, group in enumerate(groups)}
+            addr0, addr1 = initial_load_addr_regs
+            addr_deps = []
+
+            def add_io_op(engine, slot, deps, group, stage, priority=0):
+                nonlocal next_id
+                op_id = next_id
+                next_id += 1
+                ops.append(
+                    {
+                        "id": op_id,
+                        "engine": engine,
+                        "slot": slot,
+                        "deps": list(deps),
+                        "group": group,
+                        "stage": stage,
+                        "priority": priority,
+                    }
+                )
+                return op_id
+
+            for pair_i, (block0, block1) in enumerate(initial_load_pairs):
+                stage = 900 + pair_i
+                deps = list(addr_deps)
+                load0 = add_io_op(
+                    "load",
+                    ("vload", self.value_blocks[block0], addr0),
+                    deps,
+                    pair_i,
+                    stage,
+                )
+                load1 = add_io_op(
+                    "load",
+                    ("vload", self.value_blocks[block1], addr1),
+                    deps,
+                    pair_i,
+                    stage,
+                    1,
+                )
+                state_deps[local_index[block0]].append(load0)
+                state_deps[local_index[block1]].append(load1)
+                if pair_i + 1 < len(initial_load_pairs):
+                    inc_deps = [load0, load1]
+                    inc0 = add_io_op(
+                        "alu",
+                        ("+", addr0, addr0, self.pair_stride),
+                        inc_deps,
+                        pair_i,
+                        stage,
+                        2,
+                    )
+                    inc1 = add_io_op(
+                        "alu",
+                        ("+", addr1, addr1, self.pair_stride),
+                        inc_deps,
+                        pair_i,
+                        stage,
+                        3,
+                    )
+                    addr_deps = [inc0, inc1]
+
         for round_spec in round_specs:
             next_id, state_deps = self._append_vector_round_ops(
                 ops,
@@ -847,6 +911,8 @@ class KernelBuilder:
         init_scalar1 = self.alloc_scratch("init_scalar1")
         final_store_addr0 = self.alloc_scratch("final_store_addr0")
         final_store_addr1 = self.alloc_scratch("final_store_addr1")
+        startup_addr0 = self.alloc_scratch("startup_addr0")
+        startup_addr1 = self.alloc_scratch("startup_addr1")
 
         shallow_nodes = {
             node_idx: self.alloc_scratch(f"shallow_node_{node_idx}", VLEN)
@@ -883,7 +949,19 @@ class KernelBuilder:
         self.depth3_nodes = [shallow_nodes[node_idx] for node_idx in range(7, 15)]
 
         first_wave_blocks = n_blocks if rounds == 0 else min(wave_size, n_blocks)
-        for block in range(0, first_wave_blocks, 2):
+        # On the frozen two-wave submission shape, delay the lowest pairs so they
+        # load into otherwise idle early-body load slots instead of paying all 8
+        # first-wave pairs as fixed startup cost.
+        startup_delay_pairs = 4 if rounds != 0 and n_blocks == 2 * wave_size and wave_size == 16 else 0
+        startup_start_block = startup_delay_pairs * 2
+        if startup_start_block:
+            self.emit(
+                load=[
+                    ("const", value_addr0, inp_values_p + startup_start_block * VLEN),
+                    ("const", value_addr1, inp_values_p + (startup_start_block + 1) * VLEN),
+                ]
+            )
+        for block in range(startup_start_block, first_wave_blocks, 2):
             load_slots = [("vload", self.value_blocks[block], value_addr0)]
             if block + 1 < n_blocks:
                 load_slots.append(("vload", self.value_blocks[block + 1], value_addr1))
@@ -911,6 +989,21 @@ class KernelBuilder:
 
             for block in range(0, n_blocks, wave_size):
                 groups = list(range(block, min(block + wave_size, n_blocks)))
+                initial_load_pairs = None
+                initial_load_addr_regs = None
+                if block == 0 and startup_delay_pairs:
+                    initial_load_pairs = [
+                        (pair_i, pair_i + 1)
+                        for pair_i in range(0, startup_delay_pairs * 2, 2)
+                    ]
+                    self.emit(
+                        load=[
+                            ("const", startup_addr0, inp_values_p),
+                            ("const", startup_addr1, inp_values_p + VLEN),
+                        ]
+                    )
+                    initial_load_addr_regs = (startup_addr0, startup_addr1)
+
                 prefetch_pairs = None
                 if block + wave_size < n_blocks:
                     next_groups = list(
@@ -961,6 +1054,8 @@ class KernelBuilder:
                 self._build_vector_round_sequence_with_io(
                     groups,
                     round_specs,
+                    initial_load_pairs=initial_load_pairs,
+                    initial_load_addr_regs=initial_load_addr_regs,
                     prefetch_pairs=prefetch_pairs,
                     prefetch_addr_regs=(value_addr0, value_addr1),
                     store_pairs=store_pairs,
